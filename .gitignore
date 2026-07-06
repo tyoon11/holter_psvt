@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# --- OS/IDE ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Slides / Reports (not tracked) ---
+*.pptx
+*.ppt
+
+# --- Data / Artifacts ---
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# --- Logs / Results / Cache ---
+results*/
+seed_caches*/
+ray_tmp/
+*.log
+
+# --- Env / Secrets ---
+.env
+.env.*
+*.key
+*.pem
+
+# --- Local absolute-path configs (if any) ---
+local_config*.json
+
