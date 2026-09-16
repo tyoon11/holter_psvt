@@ -123,6 +123,25 @@ def read_csv_ids(path, universe_by_kind):
     return best
 
 
+def find_by_basename(basename, roots, max_depth=3):
+    """경로를 잘못 줬을 때 같은 이름의 파일을 근처에서 찾는다 (상위 1단계 + 하위 3단계)."""
+    seen = set()
+    for r in roots:
+        if not r:
+            continue
+        for base in (os.path.abspath(r), os.path.dirname(os.path.abspath(r))):
+            if base in seen or not os.path.isdir(base):
+                continue
+            seen.add(base)
+            depth0 = base.rstrip(os.sep).count(os.sep)
+            for dirpath, dirs, names in os.walk(base):
+                if dirpath.count(os.sep) - depth0 >= max_depth:
+                    dirs[:] = []
+                if basename in names:
+                    return os.path.join(dirpath, basename)
+    return None
+
+
 # =============================================================================
 def main():
     ap = argparse.ArgumentParser()
@@ -204,8 +223,14 @@ def main():
             continue
         name, path = spec.split("=", 1)
         if not os.path.exists(path):
-            print(f"  [skip] 없는 파일: {path}")
-            continue
+            found = find_by_basename(os.path.basename(path),
+                                     [os.path.dirname(path), os.getcwd()] + list(args.raw))
+            if found:
+                print(f"  [{name}] {path} 없음 → {found} 사용")
+                path = found
+            else:
+                print(f"  [skip] 없는 파일: {path} (주변 디렉토리에서도 못 찾음)")
+                continue
         print(f"\n### {name}")
         show_csv(path, keysets)
         hit = read_csv_ids(path, universe_by_kind)

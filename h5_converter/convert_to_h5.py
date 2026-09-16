@@ -27,15 +27,22 @@ from schema_v2 import create_h5_structure_v2
 USE_V2 = True
 
 
-# ✅ 레코드 하나 처리 (Ray 전용, JSON 정보까지 포함)
-@ray.remote
-def convert_one_record_ray(
+# ✅ 레코드 하나 처리 (JSON 정보까지 포함)
+#
+# output_dir 을 주면 워커가 h5 를 직접 쓰고 작은 요약 dict 만 돌려준다.
+# 주지 않으면 예전처럼 신호 전체가 담긴 payload 를 반환한다.
+#
+# 왜 필요한가: 24h record 하나의 신호는 8,640 x (1250,3) float32 = 약 130 MB 다.
+# 이걸 Ray object store 를 통해 드라이버로 되돌리면, 수천 개를 돌릴 때 object store 가
+# 넘쳐 디스크로 spill 하며 급격히 느려진다. 워커가 쓰면 이 왕복이 사라진다.
+def convert_one_record(
     record_path,
     sampling_rate,
     segment_sec,
     max_segments,
     use_dummy_fiducial=True,
     use_dummy_similarity=True,
+    output_dir=None,
 ):
     record_name = os.path.splitext(os.path.basename(record_path))[0]
     record_path_no_ext = os.path.splitext(record_path)[0]
@@ -87,7 +94,7 @@ def convert_one_record_ray(
             seg_fidupoints.append(fidu["fiducial_point"])
             seg_fidufeatures.append(fidu["fiducial_feature"])
 
-        return {
+        payload = {
             "record_name": record_name,
             "leads": leads,
             "signal": seg_signals,
@@ -101,10 +108,67 @@ def convert_one_record_ray(
             "segment_cnt": total_segments,
             "patient_info": patient_info,
         }
+        if output_dir is None:
+            return payload
+        return write_record(payload, output_dir)
 
     except Exception as e:
         logging.exception(f"[❌ EXCEPTION] {record_name} - {e}")
+        if output_dir is not None:
+            return {"record_name": record_name, "status": "error",
+                    "error": f"{type(e).__name__}: {e}"}
         return None
+
+
+def build_writer_kwargs(data):
+    """payload → create_h5_structure(_v2) 인자. 두 writer 가 같은 인자를 받는다."""
+    return dict(
+        sig_name=data["leads"],
+        n_sig=len(data["leads"]),
+        seg_len=data["segment_cnt"],
+        dataset="SNUH",
+        created_by="",
+        datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        record_filename=data["record_name"],
+        patient_id=data["patient_info"]["patient_id"],
+        age=data["patient_info"]["age"],
+        gender=data["patient_info"]["gender"],
+        signal=data["signal"],
+        beat_annotation=data["beat_annotation"],
+        sig_stats=data["sig_stats"],
+        beat_sims=data["beat_sims"],
+        fiducial_point=data["fiducial_point"],
+        fiducial_feature=data["fiducial_feature"],
+        metadata=data["metadata"],
+        annotation_data=data["annotation_data"],
+    )
+
+
+def write_record(data, output_dir):
+    """payload 를 파일로 쓰고 작은 요약만 반환한다."""
+    h5_path = os.path.join(output_dir, f"{data['record_name']}.h5")
+    kw = build_writer_kwargs(data)
+    if USE_V2:
+        create_h5_structure_v2(h5_path, **kw)
+    else:
+        with h5py.File(h5_path, "w") as h5f:
+            create_h5_structure(h5_file=h5f, **kw)
+    with h5py.File(h5_path, "r") as f:        # 실제 저장된 lead 순서를 보고한다
+        saved = f.attrs.get("sig_name", "")
+        saved = ",".join(json.loads(saved)) if USE_V2 and isinstance(saved, str) \
+            else ",".join(data["leads"])
+    return {
+        "record_name": data["record_name"],
+        "status": "ok",
+        "n_seg": data["segment_cnt"],
+        "leads": saved,
+        "src_leads": ",".join(data["leads"]),
+        "bytes": os.path.getsize(h5_path),
+    }
+
+
+# 호환용 Ray 래퍼 (기존 convert_folder_to_h5_ray 가 이 이름을 쓴다)
+convert_one_record_ray = ray.remote(convert_one_record)
 
 
 # ✅ 전체 폴더 변환 (Ray 병렬 + 직렬 저장 + 환자 정보 포함)
@@ -119,6 +183,7 @@ def convert_folder_to_h5_ray(
     valid_list_path="valid_records.csv",
     use_dummy_fiducial=True,
     use_dummy_similarity=True,
+    num_cpus=32,
 ):
     # 로깅 설정
     logging.basicConfig(
@@ -137,7 +202,7 @@ def convert_folder_to_h5_ray(
         logging.info(f"📄 valid_list_path가 없어 자동 생성 중 → {valid_list_path}")
         generate_valid_records(input_dir, valid_list_path)
 
-    ray.init(num_cpus=64)
+    ray.init(num_cpus=num_cpus, ignore_reinit_error=True)  # 공용 서버라 기본 32 로 제한
     logging.info(f"🧠 Ray initialized (CPUs: {ray.available_resources().get('CPU')})")
 
     df = pd.read_csv(valid_list_path)
@@ -178,26 +243,7 @@ def convert_folder_to_h5_ray(
                 h5_name = f"{data['record_name']}.h5"
                 h5_path = os.path.join(output_dir, h5_name)
 
-                writer_kwargs = dict(
-                    sig_name=data["leads"],
-                    n_sig=len(data["leads"]),
-                    seg_len=data["segment_cnt"],
-                    dataset="SNUH",
-                    created_by="",
-                    datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    record_filename=data["record_name"],
-                    patient_id=data["patient_info"]["patient_id"],
-                    age=data["patient_info"]["age"],
-                    gender=data["patient_info"]["gender"],
-                    signal=data["signal"],
-                    beat_annotation=data["beat_annotation"],
-                    sig_stats=data["sig_stats"],
-                    beat_sims=data["beat_sims"],
-                    fiducial_point=data["fiducial_point"],
-                    fiducial_feature=data["fiducial_feature"],
-                    metadata=data["metadata"],
-                    annotation_data=data["annotation_data"],
-                )
+                writer_kwargs = build_writer_kwargs(data)
                 if USE_V2:
                     create_h5_structure_v2(h5_path, **writer_kwargs)
                 else:
