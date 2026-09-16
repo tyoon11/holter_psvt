@@ -163,6 +163,8 @@ def write_record(data, output_dir):
         "n_seg": data["segment_cnt"],
         "leads": saved,
         "src_leads": ",".join(data["leads"]),
+        "n_beats": int(sum(len(b.get("sample", [])) for b in data["beat_annotation"])),
+        "has_report": bool(data["annotation_data"]),
         "bytes": os.path.getsize(h5_path),
     }
 

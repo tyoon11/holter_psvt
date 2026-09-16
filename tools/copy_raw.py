@@ -21,6 +21,10 @@ NAS 읽기가 86 MB/s 라 변환도 학습도 I/O 에 묶인다. 한 번 로컬�
   python copy_raw.py --src /nas/holter_raw --dest /home/coder/workspace/data/raw \
                      --ext .dat .hea .json --workers 8
 
+  # 변환에 필요한 원본만: .hea+.SIG 짝이 맞는 record 의 .hea/.SIG/.ANN/.json
+  python copy_raw.py --src /home/coder/workspace/Holter_TOF/nas1_Holter_PSVT ... \
+                     --dest /home/coder/workspace/data/raw --records-only --workers 8
+
   python copy_raw.py ... --dry-run     # 용량/파일수만 계산
   python copy_raw.py ... --verify      # 복사 후 크기 + 해시 확인 (느림)
 """
@@ -32,6 +36,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BUF = 8 * 1024 * 1024        # 8MB — NAS 에서는 큰 버퍼가 유리하다
@@ -161,6 +166,37 @@ def gather(args):
                 print(f"  [없음] {s}: {e}")
                 continue
             items.append((s, os.path.join(args.dest, rel), sz))
+    elif args.records_only:
+        # 같은 디렉토리에서 <stem>.hea 와 <stem>.SIG 가 둘 다 있는 record 만 고르고,
+        # 그 record 의 .hea/.SIG/.ANN/.json 을 복사한다. 신호 없는 .json/.ann 고아나
+        # 하위의 h5/denoised 디렉토리는 자연히 빠진다.
+        wanted = (".hea", ".SIG", ".ANN", ".json")
+        stats = Counter()
+        for root in args.src:
+            root = os.path.abspath(root)
+            for dirpath, _, names in os.walk(root):
+                nameset = set(names)
+                for nm in names:
+                    if not nm.endswith(".hea"):
+                        continue
+                    stem = nm[:-4]
+                    if stem + ".SIG" not in nameset:
+                        stats["신호(.SIG) 없는 .hea — 제외"] += 1
+                        continue
+                    stats["record"] += 1
+                    for ext in wanted:
+                        fn = stem + ext
+                        if fn not in nameset:
+                            stats[f"{ext} 없음"] += 1
+                            continue
+                        s_ = os.path.join(dirpath, fn)
+                        rel = fn if args.flatten else os.path.relpath(s_, os.path.dirname(root))
+                        try:
+                            items.append((s_, os.path.join(args.dest, rel), os.path.getsize(s_)))
+                        except OSError:
+                            pass
+        print(f"  record(.hea+.SIG) {stats.pop('record', 0):,}개"
+              + "".join(f"\n    {k}: {v:,}" for k, v in stats.most_common()))
     else:
         exts = tuple(e.lower() if e.startswith(".") else "." + e.lower()
                      for e in (args.ext or []))
@@ -191,6 +227,8 @@ def main():
                     help="확장자 필터, 예: --ext .dat .hea .json")
     ap.add_argument("--workers", type=int, default=8,
                     help="병렬 스트림 수. NAS 는 스트림을 늘리면 총 대역폭이 올라간다")
+    ap.add_argument("--records-only", action="store_true",
+                    help=".hea+.SIG 짝이 맞는 record 의 .hea/.SIG/.ANN/.json 만 복사")
     ap.add_argument("--flatten", action="store_true",
                     help="하위 디렉토리 구조를 버리고 dest 바로 아래에 둔다")
     ap.add_argument("--verify", action="store_true", help="복사 후 sha256 비교 (느림)")

@@ -37,36 +37,59 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONV_DIR = os.path.join(HERE, "..", "h5_converter")
 
-# utils.has_all_required_files 와 같은 조건 (대소문자 포함)
-REQUIRED = (".hea", ".SIG", ".ANN", ".json")
+# 신호를 읽는 데 반드시 필요한 것은 .hea + .SIG 뿐이다.
+# .ANN(beat 주석)과 .json(리포트)이 없어도 convert_one_record 는 동작한다:
+#   parse_ann 은 빈 주석을, json 로딩은 {} 를 돌려주고, v2 에는 has_beats/has_report=False
+#   로 표시된다. 기본은 포함하고, 원하면 --require-ann / --require-json 으로 제외한다.
+# 확장자는 대소문자까지 정확해야 한다. .hea 안에 'X.SIG' 로 적혀 있고
+# wfdb.rdann(..., extension="ANN") 도 대소문자를 구분한다(리눅스).
+SIGNAL = ".SIG"
+OPTIONAL = (".ANN", ".json")
 
 
 # =============================================================================
 # 대상 수집
 # =============================================================================
-def gather(raw_dirs):
-    """(record_name, hea_path) 목록과 제외 사유 집계를 만든다."""
+def gather(raw_dirs, require_ann=False, require_json=False):
+    """(record_name → hea_path), 제외 사유, 중복, 부가 정보 집계를 만든다."""
     found, skipped, dup = {}, Counter(), []
+    info = Counter()
     for root in raw_dirs:
         if not os.path.isdir(root):
             print(f"  [skip] 없는 디렉토리: {root}")
             continue
         for dirpath, _, names in os.walk(root):
             nameset = set(names)
+            lowerset = {n.lower() for n in names}
             for nm in names:
                 if not nm.lower().endswith(".hea"):
                     continue
                 base = nm[:-4]
-                missing = [e for e in REQUIRED[1:] if base + e not in nameset]
-                if missing:
-                    for e in missing:
-                        skipped[f"{e} 없음"] += 1
+                if base + SIGNAL not in nameset:
+                    # 대소문자만 다른 경우는 따로 센다 — wfdb 가 못 읽으므로 알아야 한다
+                    if (base + SIGNAL).lower() in lowerset:
+                        skipped[".SIG 대소문자 불일치"] += 1
+                    else:
+                        skipped[".SIG 없음"] += 1
+                    continue
+                has_ann = base + ".ANN" in nameset
+                has_json = base + ".json" in nameset
+                if not has_ann and (base + ".ann").lower() in lowerset:
+                    info[".ANN 대소문자 불일치 (주석을 못 읽음)"] += 1
+                if require_ann and not has_ann:
+                    skipped[".ANN 없음"] += 1
+                    continue
+                if require_json and not has_json:
+                    skipped[".json 없음"] += 1
                     continue
                 if base in found:
-                    dup.append((base, found[base], os.path.join(dirpath, nm)))
+                    dup.append((base, found[base][0], os.path.join(dirpath, nm)))
                     continue
-                found[base] = os.path.join(dirpath, nm)
-    return found, skipped, dup
+                found[base] = (os.path.join(dirpath, nm), has_ann, has_json)
+                info["주석+리포트 완비" if has_ann and has_json else
+                     ".ANN 없음 (포함)" if not has_ann and has_json else
+                     ".json 없음 (포함)" if has_ann else ".ANN·.json 둘 다 없음 (포함)"] += 1
+    return found, skipped, dup, info
 
 
 def human(n):
@@ -153,6 +176,7 @@ class ProcessBackend:
 class Progress:
     def __init__(self, total):
         self.total, self.ok, self.err, self.bytes = total, 0, 0, 0
+        self.ann_fail = 0
         self.t0 = time.time()
         self.last = 0.0
         self.tty = sys.stdout.isatty()
@@ -198,8 +222,8 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
     prog = Progress(len(records))
     log_new = not os.path.exists(log_path)
     logf = open(log_path, "a", newline="")
-    cols = ["time", "record_name", "status", "n_seg", "leads", "src_leads", "bytes", "sec",
-            "error", "hea"]
+    cols = ["time", "record_name", "status", "n_seg", "n_beats", "has_report", "ann_file",
+            "json_file", "leads", "src_leads", "bytes", "sec", "error", "hea"]
     w = csv.DictWriter(logf, fieldnames=cols, extrasaction="ignore")
     if log_new:
         w.writeheader()
@@ -211,16 +235,16 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
         while True:
             while len(pending) < inflight:
                 try:
-                    name, hea = next(it)
+                    name, hea, ann_file, json_file = next(it)
                 except StopIteration:
                     break
                 h = backend.submit(task_fn, hea, output_dir=out_dir, **task_kw)
-                pending[h] = (name, hea, time.time())
+                pending[h] = (name, hea, ann_file, json_file, time.time())
             if not pending:
                 break
             done, _ = backend.wait(pending.keys())
             for h in done:
-                name, hea, t_sub = pending.pop(h)
+                name, hea, ann_file, json_file, t_sub = pending.pop(h)
                 try:
                     res = backend.get(h)
                 except Exception as e:     # 워커 프로세스 자체가 죽은 경우
@@ -231,6 +255,10 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
                 res.setdefault("record_name", name)
                 res["sec"] = round(time.time() - t_sub, 1)
                 res["hea"] = hea
+                res["ann_file"], res["json_file"] = ann_file, json_file
+                # .ANN 파일이 있는데 beat 가 0 이면 parse_ann 이 조용히 실패한 것이다
+                if res.get("status") == "ok" and ann_file and not res.get("n_beats"):
+                    prog.ann_fail += 1
                 res["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 w.writerow(res)
                 logf.flush()
@@ -263,6 +291,8 @@ def main():
     ap.add_argument("--real-similarity", action="store_true",
                     help="beat 유사도(corr/DTW) 계산 수행 (기본은 dummy)")
     ap.add_argument("--log", default=None, help="결과 CSV (기본 <out>/conversion_log.csv)")
+    ap.add_argument("--require-ann", action="store_true", help=".ANN 없는 record 제외")
+    ap.add_argument("--require-json", action="store_true", help=".json 없는 record 제외")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -270,8 +300,11 @@ def main():
     log_path = args.log or os.path.join(args.out, "conversion_log.csv")
 
     print("[1/3] 대상 수집")
-    found, skipped, dup = gather(args.raw)
-    print(f"  변환 가능(.hea+.SIG+.ANN+.json) {len(found):,}개")
+    found, skipped, dup, info = gather(args.raw, args.require_ann, args.require_json)
+    cond = ".hea+.SIG" + ("+.ANN" if args.require_ann else "") + ("+.json" if args.require_json else "")
+    print(f"  변환 대상({cond}) {len(found):,}개")
+    for k, v in info.most_common():
+        print(f"    {k:<36s} {v:>6,}")
     if skipped:
         print("  제외: " + "  ".join(f"{k} {v:,}" for k, v in skipped.most_common()))
     if dup:
@@ -288,7 +321,7 @@ def main():
             except OSError:
                 pass
     existing = {e.name[:-3] for e in os.scandir(args.out) if e.name.endswith(".h5")}
-    todo = sorted((n, p) for n, p in found.items() if n not in existing)
+    todo = sorted((n, p, a, j) for n, (p, a, j) in found.items() if n not in existing)
     if args.limit:
         todo = todo[: args.limit]
     print(f"  이미 변환됨 {len(found) - len([n for n in found if n not in existing]):,}개"
@@ -335,6 +368,9 @@ def main():
 
     el = time.time() - t0
     print(f"\n[3/3] 완료  {hms(el)}  성공 {prog.ok:,}  실패 {prog.err:,}  출력 {human(prog.bytes)}")
+    if prog.ann_fail:
+        print(f"  ** .ANN 파일이 있는데 beat 0개: {prog.ann_fail:,}개 — parse_ann 이 조용히 "
+              f"실패했을 가능성. 로그에서 ann_file=True & n_beats=0 으로 확인 **")
     if prog.ok:
         print(f"  record당 평균 {el / max(prog.ok + prog.err, 1):.1f}초 (벽시계 기준)")
     if errors:
