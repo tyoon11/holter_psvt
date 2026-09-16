@@ -19,6 +19,12 @@ from utils import (
     generate_valid_records,
 )
 from create_h5_structure import create_h5_structure
+from schema_v2 import create_h5_structure_v2
+
+# v2 저장 구조 사용 여부. v1 은 세그먼트마다 group/dataset 을 만들어 24h record 하나가
+# dataset 141,271개가 되고 전체 읽기가 13 MB/s 로 떨어진다. v2 는 dataset 15개 이하.
+# 기존 v1 파일은 tools/repack_to_v2.py 로 변환할 수 있다.
+USE_V2 = True
 
 
 # ✅ 레코드 하나 처리 (Ray 전용, JSON 정보까지 포함)
@@ -172,28 +178,31 @@ def convert_folder_to_h5_ray(
                 h5_name = f"{data['record_name']}.h5"
                 h5_path = os.path.join(output_dir, h5_name)
 
-                with h5py.File(h5_path, "w") as h5f:
-                    create_h5_structure(
-                        h5_file=h5f,
-                        sig_name=data["leads"],
-                        n_sig=len(data["leads"]),
-                        seg_len=data["segment_cnt"],
-                        dataset="SNUH",
-                        created_by="",
-                        datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        record_filename=data["record_name"],
-                        patient_id=data["patient_info"]["patient_id"],
-                        age=data["patient_info"]["age"],
-                        gender=data["patient_info"]["gender"],
-                        signal=data["signal"],
-                        beat_annotation=data["beat_annotation"],
-                        sig_stats=data["sig_stats"],
-                        beat_sims=data["beat_sims"],
-                        fiducial_point=data["fiducial_point"],
-                        fiducial_feature=data["fiducial_feature"],
-                        metadata=data["metadata"],
-                        annotation_data=data["annotation_data"],
-                    )
+                writer_kwargs = dict(
+                    sig_name=data["leads"],
+                    n_sig=len(data["leads"]),
+                    seg_len=data["segment_cnt"],
+                    dataset="SNUH",
+                    created_by="",
+                    datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    record_filename=data["record_name"],
+                    patient_id=data["patient_info"]["patient_id"],
+                    age=data["patient_info"]["age"],
+                    gender=data["patient_info"]["gender"],
+                    signal=data["signal"],
+                    beat_annotation=data["beat_annotation"],
+                    sig_stats=data["sig_stats"],
+                    beat_sims=data["beat_sims"],
+                    fiducial_point=data["fiducial_point"],
+                    fiducial_feature=data["fiducial_feature"],
+                    metadata=data["metadata"],
+                    annotation_data=data["annotation_data"],
+                )
+                if USE_V2:
+                    create_h5_structure_v2(h5_path, **writer_kwargs)
+                else:
+                    with h5py.File(h5_path, "w") as h5f:
+                        create_h5_structure(h5_file=h5f, **writer_kwargs)
 
                 logging.info(f"[📂 SAVED] {h5_name}")
                 saved_files.append(data["record_name"])
