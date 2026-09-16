@@ -339,7 +339,16 @@ def probe_h5(path, time_full_read=True):
                 if sig["mode"] == "flat":
                     arr = f[sig["path"]][:]
                     nbytes = arr.nbytes
-                    total_samples = arr.shape[-1]
+                    # (N, C) time-major 와 (C, N) channel-first 를 모두 지원.
+                    # 채널 수는 항상 작으므로(<=12) 긴 축을 시간축으로 본다.
+                    if arr.ndim == 2 and arr.shape[0] > arr.shape[1]:
+                        rep["layout"] = "time_major (N, C)"
+                        total_samples, n_ch = arr.shape
+                        arr = arr.T                      # 이후 통계는 (C, N) 기준
+                    else:
+                        rep["layout"] = "channel_first (C, N)"
+                        n_ch, total_samples = (arr.shape if arr.ndim == 2
+                                               else (1, arr.shape[-1]))
                 else:
                     g = f[sig["path"].split("/{i}")[0]]
                     keys = sorted([k for k in g.keys() if NUMERIC.match(k)], key=int)
@@ -351,6 +360,7 @@ def probe_h5(path, time_full_read=True):
                         chunks.append(np.stack([s[l][:] for l in leads]))
                     arr = np.concatenate(chunks, axis=-1)
                     nbytes = arr.nbytes
+                    rep["layout"] = "per_segment -> (C, N)"
                     total_samples = arr.shape[-1]
                 dt_ = time.time() - t0
                 rep["full_read_sec"] = dt_
@@ -391,7 +401,8 @@ def print_h5_report(rep):
     if "full_read_sec" in rep:
         print(f"      >>> 24h 전체 읽기: {rep['full_read_sec']:.2f}초  "
               f"({rep['read_MBps']:.0f} MB/s, 신호 {human(rep['signal_bytes'])}, "
-              f"{rep['duration_h']:.1f}h, shape={rep['signal_shape']})")
+              f"{rep['duration_h']:.2f}h, shape={rep['signal_shape']}, "
+              f"layout={rep.get('layout','?')})")
         print(f"      >>> 파일/신호 크기비 = {rep['overhead_ratio']:.2f}x  "
               f"(1.0에 가까울수록 좋음; 2.0이면 절반이 메타데이터)")
         print(f"      >>> 값 범위 {rep['value_range']}, NaN 비율 {rep['nan_ratio']:.4f}")
