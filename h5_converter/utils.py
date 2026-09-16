@@ -613,12 +613,36 @@ def parse_ann(record_path):
 # =============================================================================
 # 7. 어노테이션 세그먼트 단위로 자르기
 # =============================================================================
+def prepare_ann(ann_dict):
+    """parse_ann 결과를 세그먼트 슬라이싱에 맞게 한 번만 numpy 로 바꿔 둔다.
+
+    예전에는 slice_ann_by_segment 가 세그먼트마다 전체 beat 리스트(24h 기준 약 10만 개,
+    문자열 포함)를 np.array 로 다시 만들었다. 8,280 세그먼트 × 6 필드라 record 하나에
+    약 2분이 여기서만 소모됐다 (세그먼트 처리 시간의 94%).
+    """
+    out = {k: (np.asarray(v) if isinstance(v, (np.ndarray, list)) else v)
+           for k, v in ann_dict.items()}
+    s = out.get("sample")
+    out["_sorted"] = bool(isinstance(s, np.ndarray) and (s.size < 2 or np.all(s[1:] >= s[:-1])))
+    return out
+
+
 def slice_ann_by_segment(ann_dict, start, end):
-    sample = np.array(ann_dict["sample"])
-    idx = (sample >= start) & (sample < end)
+    """[start, end) 구간의 주석. sample 은 구간 시작 기준 상대값.
+
+    prepare_ann 을 거친 dict 이면 이진 탐색으로 O(log n) 에 자르고,
+    그렇지 않으면 예전과 같은 마스크 방식으로 동작한다. 반환 형식은 동일하다.
+    """
+    sample = np.asarray(ann_dict["sample"])
+    if ann_dict.get("_sorted"):
+        lo, hi = np.searchsorted(sample, [start, end], side="left")
+        sel = slice(int(lo), int(hi))
+    else:
+        sel = (sample >= start) & (sample < end)
     result = {
-        k: np.array(v)[idx].tolist() if isinstance(v, (np.ndarray, list)) else []
+        k: np.asarray(v)[sel].tolist() if isinstance(v, (np.ndarray, list)) else []
         for k, v in ann_dict.items()
+        if not k.startswith("_")
     }
     result["sample"] = (np.array(result["sample"]) - start).tolist()
     return result

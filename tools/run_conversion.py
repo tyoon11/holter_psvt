@@ -50,6 +50,27 @@ OPTIONAL = (".ANN", ".json")
 # =============================================================================
 # 대상 수집
 # =============================================================================
+def hea_refs_ok(hea_path, base):
+    """.hea 가 참조하는 신호 파일명이 실제 파일명(<base>.SIG)과 같은지.
+
+    다르면 wfdb 가 없는 파일을 열려다 FileNotFoundError 로 실패한다.
+    원본에서 흔한 문제이며 복사본에 fix_pid.py 를 돌리면 해결된다.
+    """
+    try:
+        with open(hea_path, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                parts = line.split()
+                if not parts:
+                    continue
+                if i > 0 and parts[0].upper().endswith(".SIG"):
+                    return parts[0] == base + SIGNAL
+                if i > 3:
+                    break
+    except OSError:
+        return False
+    return True
+
+
 def gather(raw_dirs, require_ann=False, require_json=False):
     """(record_name → hea_path), 제외 사유, 중복, 부가 정보 집계를 만든다."""
     found, skipped, dup = {}, Counter(), []
@@ -81,6 +102,9 @@ def gather(raw_dirs, require_ann=False, require_json=False):
                     continue
                 if require_json and not has_json:
                     skipped[".json 없음"] += 1
+                    continue
+                if not hea_refs_ok(os.path.join(dirpath, nm), base):
+                    skipped[".hea 내부 이름 불일치 (fix_pid.py 필요)"] += 1
                     continue
                 if base in found:
                     dup.append((base, found[base][0], os.path.join(dirpath, nm)))
@@ -307,6 +331,9 @@ def main():
         print(f"    {k:<36s} {v:>6,}")
     if skipped:
         print("  제외: " + "  ".join(f"{k} {v:,}" for k, v in skipped.most_common()))
+        if skipped.get(".hea 내부 이름 불일치 (fix_pid.py 필요)"):
+            print("  ** .hea 안의 신호 파일명이 실제와 다른 record 가 있습니다. 복사본에서 "
+                  "`python h5_converter/fix_pid.py <복사본 경로>` 를 먼저 실행하세요. **")
     if dup:
         print(f"  ** 같은 record 이름이 여러 곳에 있음 {len(dup):,}건 — 먼저 찾은 것만 사용 **")
         for b, a1, a2 in dup[:3]:
@@ -363,8 +390,14 @@ def main():
     try:
         prog, errors = run(todo, args.out, backend, convert_one_record, task_kw,
                            inflight, log_path)
-    finally:
-        backend.close()
+    except KeyboardInterrupt:
+        print("워커 정리 중... (다시 Ctrl+C 하면 즉시 종료)")
+        try:
+            backend.close()
+        except KeyboardInterrupt:
+            pass
+        os._exit(130)
+    backend.close()
 
     el = time.time() - t0
     print(f"\n[3/3] 완료  {hms(el)}  성공 {prog.ok:,}  실패 {prog.err:,}  출력 {human(prog.bytes)}")
@@ -374,7 +407,12 @@ def main():
     if prog.ok:
         print(f"  record당 평균 {el / max(prog.ok + prog.err, 1):.1f}초 (벽시계 기준)")
     if errors:
-        reasons = Counter(str(e.get("error", ""))[:60] for e in errors)
+        import re
+        def _short(msg):
+            msg = re.sub(r"\x1b\[[0-9;]*m", "", str(msg))
+            msg = re.sub(r"'(/[^']*/)([^/']+)'", r"'…/\2'", msg)   # 경로는 파일명만
+            return msg.strip().splitlines()[-1][:140] if msg.strip() else ""
+        reasons = Counter(_short(e.get("error", "")) for e in errors)
         print("  실패 사유 상위:")
         for r, n in reasons.most_common(5):
             print(f"    {n:>5,}  {r}")

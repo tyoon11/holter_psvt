@@ -15,6 +15,7 @@ from utils import (
     parse_ann,
     parse_annotation_json,
     slice_ann_by_segment,
+    prepare_ann,
     extract_patient_info,
     generate_valid_records,
 )
@@ -54,7 +55,7 @@ def convert_one_record(
         full_signal = record.p_signal.T
         total_length = full_signal.shape[1]
 
-        ann_data = parse_ann(record_path_no_ext)
+        ann_data = prepare_ann(parse_ann(record_path_no_ext))   # 한 번만 배열화
         try:
             with open(record_path_no_ext + ".json") as f:
                 annotation_json = json.load(f)
