@@ -262,31 +262,73 @@ def write_v2(
 def flatten_report(annotation_data):
     """v1 의 중첩 annotation group 을 평탄한 dict 로 바꾼다.
 
-    ECG/annotation/beat_count/VentricularBeat/Runs/LongestRunBPM
-        → vb_run_LongestRunBPM
+    v1 writer 는 General / Ventriculars / Supraventriculars 만 읽었는데, 실제 .json 에는
+    PatientInfo 와 HeartRates 도 들어있다. 둘 다 학습에 바로 쓸 수 있어 함께 뽑는다.
+      - HeartRates: min/avg/max 심박수와 그 시각, 빈맥·서맥 beat 수와 비율
+        → SSL 보조 타깃(L_beat 계열)과 QC 필터로 유용하다.
+      - PatientInfo/HookupDate+HookupTime: 기록 시작 절대 시각
+        → time-of-day 임베딩의 기준. .hea 의 base_date/base_time 이 비어 있을 때 대체된다.
+
+    값에 "Unknown", "< 1" 같은 문자열이 섞여 있으므로 숫자 변환은 실패해도 죽지 않는다.
     """
     out = {}
-    hr = (annotation_data or {}).get("Holter Report", {})
-    gen = hr.get("General", {})
+    hr_root = (annotation_data or {}).get("Holter Report", {})
+    gen = hr_root.get("General", {})
 
     def _int(v, default=0):
         try:
-            return int(v)
+            return int(float(v))
         except (TypeError, ValueError):
             return default
 
+    def _num(v):
+        """숫자면 float, 아니면 빈 문자열. 'Unknown' 을 0 으로 오해하지 않게 한다."""
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    # ---- 환자 / 기록 정보 ----
+    pi = hr_root.get("PatientInfo", {})
+    for src, dst in (("PID", "report_pid"), ("Age", "report_age"),
+                     ("Gender", "report_gender"), ("Duration", "report_duration"),
+                     ("HookupDate", "hookup_date"), ("HookupTime", "hookup_time")):
+        if src in pi:
+            out[dst] = _to_str(pi[src])
+
+    # ---- 전체 집계 ----
     out["ann_len"] = _int(gen.get("QRScomplexes", 0))
     out["NoisePercentage"] = _to_str(gen.get("NoisePercentage", ""))
     out["AFAFLPercentage"] = _to_str(gen.get("AFAFLPercentage", ""))
 
+    # ---- 심박수 ----
+    hrs = hr_root.get("HeartRates", {})
+    for key, prefix in (("MinimumRate", "hr_min"), ("AverageRate", "hr_avg"),
+                        ("MaximumRate", "hr_max")):
+        d = hrs.get(key, {})
+        if d:
+            out[prefix] = _num(d.get("Value"))
+            if "Timestamp" in d:
+                out[f"{prefix}_ts"] = _to_str(d.get("Timestamp"))
+    for key, prefix, pct in (("TachycardiaBeats", "tachy", "TachycardiaPercentage"),
+                             ("BradycardiaBeats", "brady", "BradycardiaPercentage")):
+        d = hrs.get(key, {})
+        if d:
+            out[f"{prefix}_beats"] = _num(d.get("Value"))
+            out[f"{prefix}_pct"] = _num(d.get(pct))
+
+    # ---- 심실성 / 상심실성 ----
     for prefix, key, sub in (("vb", "VentricularBeats", "Ventriculars"),
                              ("sb", "SupraventricularBeats", "Supraventriculars")):
-        d = hr.get(sub, {})
+        d = hr_root.get(sub, {})
         out[f"{prefix}_total"] = _int(gen.get(key, 0))
         for k in ("Isolated", "Couplets", "BigeminalCycles"):
             out[f"{prefix}_{k}"] = _int(d.get(k, 0))
         out[f"{prefix}_run_count"] = _int(d.get("Runs", 0))
-        out[f"{prefix}_run_TotalBeats"] = _int(gen.get(key, 0))
+        # run 안의 beat 총수는 Ventriculars/TotalBeats 다.
+        # v1 writer 는 여기에 General/VentricularBeats(=전체 이소성 beat 수)를 넣었는데
+        # 서로 다른 값이다(예: General 9 vs TotalBeats 0). 원본 필드를 우선한다.
+        out[f"{prefix}_run_TotalBeats"] = _int(d.get("TotalBeats", gen.get(key, 0)))
         for k in RUN_FIELDS[2:]:
             out[f"{prefix}_run_{k}"] = _to_str(d.get(k, ""))
 

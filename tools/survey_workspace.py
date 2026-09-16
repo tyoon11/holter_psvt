@@ -29,7 +29,9 @@ import sys
 DEFAULT_ROOT = "/home/coder/workspace/Holter_TOF"
 BAR = "=" * 78
 SIG_EXT = (".h5", ".hdf5", ".dat", ".npy", ".mat")
-RAW_EXT = (".dat", ".hea", ".json", ".atr", ".ecg", ".xml")
+# 이 데이터셋의 원본은 WFDB 표준 .dat 가 아니라 MARS export 의 .SIG 이고,
+# beat 주석은 .ANN 이다 (utils.py 의 has_all_required_files 참고).
+RAW_EXT = (".dat", ".sig", ".hea", ".json", ".ann", ".atr", ".ecg", ".xml")
 
 
 def human(n):

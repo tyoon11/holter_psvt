@@ -35,7 +35,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from survey_workspace import show_csv, human  # noqa: E402
 
-RAW_EXT = (".dat", ".hea", ".json", ".atr", ".xml", ".ecg")
+# 원본 한 벌 = .hea + 신호 + (.ann) + (.json).
+# 신호는 MARS export 의 .SIG 이며 WFDB 표준 .dat 가 아니다.
+# .xml 은 별도 modality(10초 ECG)라 record 묶음에서 제외한다.
+RAW_EXT = (".dat", ".sig", ".hea", ".json", ".ann", ".atr")
+SIGNAL_EXT = (".sig", ".dat")
+# h5_converter/utils.py 의 has_all_required_files 와 같은 조건.
+# 넷 중 하나라도 없으면 convert_to_h5.py 가 건너뛴다.
+CONVERT_REQ = (".hea", ".sig", ".ann", ".json")
 BAR = "=" * 78
 
 
@@ -124,28 +131,49 @@ def main():
     ap.add_argument("--clinical", nargs="*", default=[], help="name=path")
     ap.add_argument("--dest", default="/home/coder/workspace/data/raw")
     ap.add_argument("--strategy", default="all",
-                    choices=["all", "csv", "unconverted", "converted"],
-                    help="all=raw 전부 / csv=임상 CSV 에 있는 것만 / "
-                         "unconverted=아직 h5 없는 것만 / converted=이미 h5 있는 것만")
+                    choices=["all", "convertible", "csv", "unconverted", "converted"],
+                    help="all=신호 있는 것 전부 / convertible=4종 완비(권장) / "
+                         "csv=임상 CSV 에 있는 것만 / unconverted=아직 h5 없는 것만 / "
+                         "converted=이미 h5 있는 것만")
     ap.add_argument("--out", default="migration_plan")
     args = ap.parse_args()
 
     # ---- raw / h5 스캔 ----
     print(BAR); print("[1] 원본(raw) 스캔"); print(BAR)
     raw = scan_raw(args.raw) if args.raw else {}
-    complete = {s: v for s, v in raw.items() if ".dat" in v and ".hea" in v}
+    # 신호(.SIG/.dat) + .hea 가 있어야 최소한 읽을 수 있다.
+    complete = {k: v for k, v in raw.items()
+                if ".hea" in v and any(e in v for e in SIGNAL_EXT)}
+    # 넷을 다 갖춰야 convert_to_h5.py 가 변환한다.
+    convertible = {k: v for k, v in complete.items()
+                   if all(e in v for e in CONVERT_REQ)}
     if raw:
         ext_n = collections.Counter(e for v in raw.values() for e in v)
-        print(f"  raw record stem {len(raw):,}개  (.dat+.hea 완전 {len(complete):,}개)")
+        print(f"  raw record stem {len(raw):,}개")
         print(f"  확장자별 파일 수: {dict(ext_n)}")
-        with_json = sum(1 for v in complete.values() if ".json" in v)
-        print(f"  .json(리포트) 동반: {with_json:,}/{len(complete):,}  "
-              f"← 이게 있어야 beat 주석·AF% 를 얻는다")
-        tot = sum(sz for v in complete.values() for _, sz in v.values())
-        print(f"  총 용량 {human(tot)}  (record당 평균 {human(tot/max(len(complete),1))})")
-        dirs = collections.Counter(os.path.dirname(v[".dat"][0]) for v in complete.values())
-        for d, n in dirs.most_common(5):
-            print(f"    {d}  ({n:,})")
+        print(f"  신호+헤더 보유        {len(complete):,}")
+        print(f"  변환 가능(.hea+.SIG+.ANN+.json)  {len(convertible):,}   "
+              f"← utils.py has_all_required_files 조건")
+        missing = collections.Counter()
+        for k, v in complete.items():
+            for e in CONVERT_REQ:
+                if e not in v:
+                    missing[e] += 1
+        if missing:
+            print(f"  변환 불가 사유(중복 집계): "
+                  + "  ".join(f"{e} 없음 {n:,}" for e, n in missing.most_common()))
+        tot = sum(sz for v in convertible.values() for _, sz in v.values())
+        print(f"  변환 대상 총 용량 {human(tot)}  "
+              f"(record당 평균 {human(tot/max(len(convertible),1))})")
+        dirs = collections.Counter()
+        for v in complete.values():
+            sig = next((v[e][0] for e in SIGNAL_EXT if e in v), None)
+            if sig:
+                dirs[os.path.dirname(sig)] += 1
+        for d, n in dirs.most_common(6):
+            nconv = sum(1 for k, v in convertible.items()
+                        if os.path.dirname(next(v[e][0] for e in SIGNAL_EXT if e in v)) == d)
+            print(f"    {d}\n      신호 {n:,}개 중 변환 가능 {nconv:,}개")
     else:
         print("  ** 원본을 찾지 못했습니다 (--raw 미지정이거나 h5 만 남음) **")
     print()
@@ -203,7 +231,12 @@ def main():
         row = {
             "record": name, "pid": pid_of(name),
             "has_raw": bool(r),
+            "has_sig": any(e in r for e in SIGNAL_EXT),
+            "has_ann": ".ann" in r,
             "has_json": ".json" in r,
+            "convertible": name in convertible,
+            "raw_dir": (os.path.dirname(next((r[e][0] for e in SIGNAL_EXT if e in r), ""))
+                        if r else ""),
             "raw_bytes": sum(sz for _, sz in r.values()),
         }
         for c, d in h5.items():
@@ -219,7 +252,10 @@ def main():
 
     print(f"  전체 record(raw ∪ h5): {len(rows):,}")
     print(f"    raw 보유            {cnt(lambda r: r['has_raw']):>6,}"
-          f"   (그중 .json 동반 {cnt(lambda r: r['has_json']):,})")
+          f"   (.ann {cnt(lambda r: r['has_ann']):,} / .json {cnt(lambda r: r['has_json']):,})")
+    print(f"    변환 가능           {cnt(lambda r: r['convertible']):>6,}")
+    print(f"    변환 가능 & h5 없음 {cnt(lambda r: r['convertible'] and not r['in_any_h5']):>6,}"
+          f"   ← 변환하면 완전한 record 순증")
     print(f"    h5 보유             {cnt(lambda r: r['in_any_h5']):>6,}")
     print(f"    raw 만 (미변환)     {cnt(lambda r: r['has_raw'] and not r['in_any_h5']):>6,}"
           f"   ← 변환하면 순증")
@@ -237,6 +273,9 @@ def main():
     if args.strategy == "all":
         sel = [r for r in rows if r["has_raw"]]
         why = "원본이 있는 record 전부"
+    elif args.strategy == "convertible":
+        sel = [r for r in rows if r["convertible"]]
+        why = ".hea+.SIG+.ANN+.json 4종을 갖춰 바로 변환 가능한 record"
     elif args.strategy == "csv":
         sel = [r for r in rows if r["has_raw"] and r["in_any_csv"]]
         why = "임상 CSV 에 포함되고 원본이 있는 record"
@@ -267,11 +306,11 @@ def main():
     files_txt = args.out + "_files.txt"
     table_csv = args.out + "_records.csv"
     if sel:
-        srcs = sorted({os.path.dirname(complete[r["record"]][".dat"][0]) for r in sel})
+        srcs = sorted({r["raw_dir"] for r in sel if r["raw_dir"]})
         base = os.path.commonpath(srcs) if len(srcs) > 1 else srcs[0]
         with open(files_txt, "w") as f:
             for r in sel:
-                for _, (p, _sz) in sorted(complete[r["record"]].items()):
+                for _, (p, _sz) in sorted(raw[r["record"]].items()):
                     f.write(os.path.relpath(p, base) + "\n")
         print(f"\n[saved] {files_txt}  (rsync 목록, 기준 경로 {base})")
         print(f"  실행:  rsync -a --info=progress2 --files-from={files_txt} \\")
