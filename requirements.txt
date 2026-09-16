@@ -1,0 +1,26 @@
+# holter_psvt 전체 의존성 (h5_converter / tools / holter_encoder / psvt_pipeline)
+#
+# torch 는 CUDA 버전에 맞춰 별도 설치한다 (아래 주석 참고). 여기서는 제외.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# --- 공통 ---
+numpy
+pandas
+scipy
+h5py
+tqdm
+
+# --- h5_converter: 원본(.hea/.SIG/.ANN/.json) 읽기와 특징 추출 ---
+wfdb
+neurokit2
+PyWavelets            # neurokit2 ecg_delineate(method="dwt") 가 import pywt
+dtw-python            # utils.py 의 dtw(a, b).distance API. 'dtw' 패키지는 다른 것이다
+
+# --- 병렬 처리 ---
+ray
+
+# --- tools/build_manifest.py 의 parquet 저장 (없으면 csv 만 저장) ---
+pyarrow
+
+# --- psvt_pipeline ---
+scikit-learn
