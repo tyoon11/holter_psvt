@@ -171,19 +171,94 @@ def main():
                 f"(환자 pos {sub.loc[sub[col]==1,'pid'].nunique():,})"
                 + flag)
 
+    # ---- 시각 정보 점검 ----
+    # .hea 의 base_date/base_time 은 MARS 에서 내보낸 날짜일 수 있다(서버 결과 전부 2024년).
+    # 실제 촬영 시작은 .json 의 hookup_date/hookup_time. time-of-day 임베딩의 기준이 된다.
+    log("\n[시각 정보] .hea(base_*) vs .json(hookup_*)")
+    hy = pd.to_numeric(el.get("hookup_date", pd.Series(index=el.index, dtype=str)).astype(str).str[:4],
+                       errors="coerce")
+    by = pd.to_numeric(el["base_date"].astype(str).str[:4], errors="coerce")
+    ht = el.get("hookup_time", pd.Series(index=el.index, dtype=str)).astype(str).str[:5]
+    bt = el["base_time"].astype(str).str[:5]
+    has_h = ht.str.match(r"^\d{1,2}:\d{2}")
+    log(f"  hookup_time 보유 {int(has_h.sum()):,}/{len(el):,}")
+    if has_h.any():
+        same_t = (ht[has_h].str.zfill(5) == bt[has_h].str.zfill(5)).mean()
+        log(f"  .hea base_time == .json hookup_time (분 단위): {100*same_t:.1f}%")
+        log(f"  연도  .hea: {by.min():.0f}~{by.max():.0f}   .json hookup: {hy.min():.0f}~{hy.max():.0f}")
+        if same_t < 0.9:
+            log("  ** .hea 시각은 촬영 시작이 아닙니다. 촬영일·time-of-day 는 hookup_date/hookup_time 을 쓸 것 **")
+
+    # ---- 라벨 출처 간 일치 ----
+    if "label_is_psvt" in df:
+        t = el.dropna(subset=["y_psvt"])
+        ip = pd.to_numeric(t["label_is_psvt"], errors="coerce")
+        both = t[ip.notna()]
+        if len(both):
+            ct = pd.crosstab(both["y_psvt"].astype(int), ip[ip.notna()].astype(int),
+                             rownames=["psvt_Label"], colnames=["is_psvt"])
+            log("\n[라벨 일치] clinical_data_psvt Label × psvt_labeling is_psvt (record 수)")
+            for line in ct.to_string().splitlines():
+                log("  " + line)
+
     # ---- 교란 요인 점검 ----
-    log("\n[교란 점검] 코호트별 연령·기록 연도·길이 (LongQT/TOF 가 코호트 소속으로 정의되므로)")
-    age = pd.to_numeric(el.get("age"), errors="coerce").replace(-1, np.nan)
-    year = pd.to_numeric(el["base_date"].astype(str).str[:4], errors="coerce")
+    log("\n[교란 점검] 코호트별 나이·촬영 연도·길이·평균 HR")
+    age = pd.to_numeric(el.get("age"), errors="coerce").where(lambda x: x >= 0)
+    year = hy if hy.notna().any() else by
     tmp = pd.DataFrame({"cohort": el["cohort"], "age": age, "year": year,
                         "dur": pd.to_numeric(el["duration_h"], errors="coerce"),
                         "hr": pd.to_numeric(el.get("mean_hr_bpm"), errors="coerce")})
     for c, g in tmp.groupby("cohort"):
         q = lambda s: f"{s.median():.0f} [{s.quantile(.25):.0f}-{s.quantile(.75):.0f}]" if s.notna().any() else "-"
-        log(f"  {c:<26s} n={len(g):>5,}  나이 {q(g['age']):<14s} 기록연도 {q(g['year']):<18s}"
+        log(f"  {c:<26s} n={len(g):>5,}  나이 {q(g['age']):<13s} 촬영연도 {q(g['year']):<17s}"
             f" 길이(h) {g['dur'].median():.1f}  평균HR {q(g['hr'])}")
-    log("  ※ 코호트 간 나이/연도 분포가 크게 다르면 모델이 질환 대신 이것을 학습할 수 있다.")
-    log("    보고 시 나이·연도 매칭 또는 층화 평가를 함께 제시할 것.")
+
+    # 나이·HR·성별만으로 태스크가 얼마나 풀리는가 — 인코더가 넘어야 할 기준선
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.impute import SimpleImputer
+    except ImportError:
+        log("  (scikit-learn 없음 — 교란 기준선 생략)")
+    else:
+        sex = el.get("gender", pd.Series(index=el.index, dtype=str)).astype(str).str.lower().str[:1]
+        X = pd.DataFrame({"age": age, "hr": tmp["hr"],
+                          "male": sex.map({"m": 1.0, "f": 0.0})}, index=el.index)
+        log("\n[교란 기준선] 나이 + 평균HR + 성별 로지스틱 회귀 (train 학습 → test AUROC, 환자 부트스트랩 95% CI)")
+        rng = np.random.default_rng(0)
+        for task, col in (("LongQT", "y_lqt"), ("TOF", "y_tof"), ("PSVT", "y_psvt")):
+            m = el[col].notna()
+            tr, te = m & (el["split"] == "train"), m & (el["split"] == "test")
+            if el.loc[tr, col].nunique() < 2 or el.loc[te, col].nunique() < 2:
+                continue
+            clf = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(),
+                                LogisticRegression(class_weight="balanced", max_iter=1000))
+            clf.fit(X[tr], el.loc[tr, col])
+            prob = pd.Series(clf.predict_proba(X[te])[:, 1], index=el.index[te])
+            y = el.loc[te, col]
+            auc = roc_auc_score(y, prob)
+            pids = el.loc[te, "pid"].unique()
+            by_pid = {p: np.where(el.loc[te, "pid"].values == p)[0] for p in pids}
+            boots = []
+            for _ in range(300):
+                idx = np.concatenate([by_pid[p] for p in rng.choice(pids, len(pids))])
+                if y.iloc[idx].nunique() == 2:
+                    boots.append(roc_auc_score(y.iloc[idx], prob.iloc[idx]))
+            lo, hi = np.percentile(boots, [2.5, 97.5])
+            n_pos_pat = el.loc[te & (el[col] == 1), "pid"].nunique()
+            warn = "   ← 인코더 성능 해석 시 이 값과 비교" if auc >= 0.75 else ""
+            log(f"  {task:<7s} AUROC {auc:.3f} [{lo:.3f}-{hi:.3f}]  (test 양성 환자 {n_pos_pat}명){warn}")
+        log("  ※ 기준선이 높은 태스크는 인코더 AUROC 만으로 질환 학습을 주장하기 어렵다.")
+        log("    나이/HR 을 공변량으로 넣은 모델 대비 향상, 또는 나이 층화 평가를 함께 보고할 것.")
+
+    # 작은 양성 집단 경고
+    for task, col in (("LongQT", "y_lqt"), ("TOF", "y_tof"), ("PSVT", "y_psvt")):
+        n = el.loc[(el["split"] == "test") & (el[col] == 1), "pid"].nunique()
+        if n < 30:
+            log(f"  ** {task} test 양성 환자 {n}명 — record 가 환자 안에서 상관되므로 환자 단위로 집계하고 "
+                f"환자 부트스트랩 CI 를 보고할 것 **")
 
     df.to_csv(args.out + ".csv", index=False)
     with open(args.out + "_summary.txt", "w") as f:
