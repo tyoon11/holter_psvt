@@ -45,7 +45,7 @@ def convert_one_record(
     use_dummy_similarity=True,
     output_dir=None,
     extra_attrs=None,
-    lead_mode="assumed",
+    lead_mode="confirmed",
 ):
     record_name = os.path.splitext(os.path.basename(record_path))[0]
     record_path_no_ext = os.path.splitext(record_path)[0]
@@ -55,10 +55,11 @@ def convert_one_record(
         record, metadata = parse_hea(record_path)
         leads = record.sig_name
         # .hea 에 lead 이름이 없으면(MARS export) utils.parse_hea 가 3채널에 ["V5","V1","II"] 를
-        # 하드코딩한다. 이 가정은 검증되지 않았다(tools/check_lead_consistency.py 참고).
-        #   lead_mode="assumed": 가정 이름을 쓴다 → v2 가 II,V1,V5 순서로 재배열
-        #   lead_mode="file"   : 파일 채널 순서 그대로 ch0,ch1,ch2 로 저장, 재배열하지 않음.
-        #                        이름이 확정되면 tools/relabel_leads.py 로 attr 만 바꾼다.
+        # 붙인다. 이 순서는 전 코호트에서 확인됐다 (2026-09-17).
+        #   lead_mode="confirmed": 그 이름을 쓰고 v2 가 II,V1,V5 순서로 재배열 (기본)
+        #   lead_mode="assumed"  : 동작은 confirmed 와 같고 lead_source 만 "assumed" 로 기록 (과거 호환)
+        #   lead_mode="file"     : 파일 채널 순서 그대로 ch0,ch1,ch2 로 저장, 재배열하지 않음.
+        #                          나중에 tools/relabel_leads.py 로 attr 만 바꾼다.
         lead_info = {"lead_mode": lead_mode}
         import wfdb as _wfdb
         raw_desc = list(_wfdb.rdheader(record_path_no_ext).sig_name or [])
@@ -67,7 +68,9 @@ def convert_one_record(
             lead_info["lead_names_assumed"] = ",".join(leads)
             if lead_mode == "file":
                 leads = [f"ch{i}" for i in range(len(leads))]
-        lead_info["lead_source"] = "assumed" if unnamed else "hea"
+        lead_info["lead_source"] = ("hea" if not unnamed else
+                                    "confirmed" if lead_mode == "confirmed" else
+                                    "unnamed" if lead_mode == "file" else "assumed")
         extra_attrs = {**(extra_attrs or {}), **lead_info}
         full_signal = record.p_signal.T
         total_length = full_signal.shape[1]

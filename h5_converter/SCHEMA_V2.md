@@ -150,16 +150,21 @@ record 하나 ≈ **63 MB**, dataset 18개, group 3~4개.
 
 ### lead 이름 (`--lead-mode`)
 
-원본 `.hea` 의 채널 설명이 전부 `"MARS export"` 라 lead 이름이 없다. `utils.parse_hea` 는
-3채널이면 `["V5","V1","II"]` 를 하드코딩하는데 이는 검증되지 않은 가정이다.
+원본 `.hea` 의 채널 설명은 전부 `"MARS export"` 라 이름이 없다. 파일 채널 순서는
+**V5, V1, II** 이며 전 코호트(PSVT/TOF/LQT)에서 확인했다 (2026-09-17).
+`utils.parse_hea` 가 이 이름을 붙인다.
 
-| 모드 | `sig_name` | 채널 배열 | 이후 |
+| 모드 | `sig_name` | 채널 배열 | `lead_source` |
 |---|---|---|---|
-| `file` (기본) | `["ch0","ch1","ch2"]` | 원본 순서 그대로 | 확정되면 `tools/relabel_leads.py` 로 attr 만 변경 |
-| `assumed` | `["II","V1","V5"]` | 가정 이름 기준 재배열 | 가정이 틀리면 재변환 필요 |
+| `confirmed` (기본) | `["II","V1","V5"]` | 원본 V5,V1,II 를 재배열 | `confirmed` |
+| `file` | `["ch0","ch1","ch2"]` | 원본 순서 그대로 | `unnamed` → relabel 후 `relabeled` |
+| `assumed` | `["II","V1","V5"]` | confirmed 와 동일 | `assumed` (과거 호환) |
 
-관련 root attr: `lead_mode`, `lead_source`(`assumed`/`hea`/`relabeled`),
-`lead_names_assumed`(가정 이름, 원본 채널 순서), relabel 시 `sig_name_prev`.
+`file` 모드로 만든 파일은 `tools/relabel_leads.py --names V5,V1,II` 로 이름만 붙이며, 이 경우
+배열은 **V5,V1,II 순서로 남는다**. 한 출력 폴더에 두 방식이 섞이면 파일마다 채널 순서가 달라지므로
+`run_conversion.py` 가 거부한다.
+
+관련 root attr: `lead_mode`, `lead_source`, `lead_names_assumed`(원본 채널 순서 이름), relabel 시 `sig_name_prev`.
 
 ### 코호트
 

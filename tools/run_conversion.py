@@ -331,9 +331,12 @@ def main():
                     help="neurokit fiducial 추출 수행 (기본은 dummy, 훨씬 빠름)")
     ap.add_argument("--real-similarity", action="store_true",
                     help="beat 유사도(corr/DTW) 계산 수행 (기본은 dummy)")
-    ap.add_argument("--lead-mode", choices=["file", "assumed"], default="file",
-                    help="file: 원본 채널 순서 그대로 ch0,ch1,ch2 로 저장(기본, lead 미확정 상태에 안전) / "
-                         "assumed: utils.py 하드코딩 이름(V5,V1,II)으로 II,V1,V5 재배열")
+    ap.add_argument("--lead-mode", choices=["confirmed", "file", "assumed"], default="confirmed",
+                    help="confirmed(기본): 원본 채널 V5,V1,II 를 II,V1,V5 로 재배열해 저장 / "
+                         "file: 원본 순서 그대로 ch0,ch1,ch2 로 저장 / "
+                         "assumed: confirmed 와 같은 동작, lead_source 만 assumed")
+    ap.add_argument("--allow-mixed", action="store_true",
+                    help="출력 폴더에 다른 lead-mode 로 만든 파일이 있어도 진행")
     ap.add_argument("--log", default=None, help="결과 CSV (기본 <out>/conversion_log.csv)")
     ap.add_argument("--require-ann", action="store_true", help=".ANN 없는 record 제외")
     ap.add_argument("--require-json", action="store_true", help=".json 없는 record 제외")
@@ -368,6 +371,29 @@ def main():
             except OSError:
                 pass
     existing = {e.name[:-3] for e in os.scandir(args.out) if e.name.endswith(".h5")}
+
+    # lead-mode 가 다른 파일과 섞이면 채널 배열 순서가 파일마다 달라진다
+    #   file → V5,V1,II 원본 순서 / confirmed·assumed → II,V1,V5
+    if existing and not args.dry_run:
+        import h5py
+        want_reorder = args.lead_mode != "file"
+        modes = Counter()
+        for n in existing:
+            try:
+                with h5py.File(os.path.join(args.out, n + ".h5"), "r") as f:
+                    m = f.attrs.get("lead_mode", "(없음: 이전 버전)")
+                    m = m.decode() if isinstance(m, bytes) else str(m)
+            except OSError:
+                m = "(읽기 실패)"
+            modes[m] += 1
+        conflict = {m: c for m, c in modes.items()
+                    if (m == "file") == want_reorder or m.startswith("(")}
+        if conflict and not args.allow_mixed:
+            print(f"  기존 출력 lead_mode: {dict(modes)}")
+            sys.exit(f"  ** 거부: 요청한 --lead-mode {args.lead_mode} 와 채널 배열이 다른 기존 파일이 있습니다 "
+                     f"{conflict}. 섞이면 파일마다 채널 순서가 달라집니다.\n"
+                     f"     → 기존 것과 같은 --lead-mode 로 이어서 돌리거나, 출력 폴더를 비우고 다시 시작하세요.\n"
+                     f"       (file 모드로 이미 다 만들었다면: tools/relabel_leads.py --names V5,V1,II)")
     todo = sorted((n, p, a, j, c) for n, (p, a, j, c) in found.items() if n not in existing)
     by_cohort = Counter(c for *_, c in todo)
     print("  코호트별: " + "  ".join(f"{k} {v:,}" for k, v in by_cohort.most_common()))
@@ -409,7 +435,7 @@ def main():
                    lead_mode=args.lead_mode)
     if args.lead_mode == "file" and args.real_fiducial:
         print("  ** 주의: --lead-mode file 에서는 lead 이름이 ch0~2 라 fiducial 추출이 II 를 "
-              "찾지 못한다. fiducial 이 필요하면 lead 확정 후 --lead-mode assumed 로 변환 **")
+              "찾지 못한다. fiducial 이 필요하면 --lead-mode confirmed 로 변환 **")
 
     Backend = RayBackend if args.backend == "ray" else ProcessBackend
     backend = Backend(args.cpus, args.ray_tmp)

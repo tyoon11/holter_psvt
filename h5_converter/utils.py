@@ -562,6 +562,8 @@ def parse_hea(record_path):
                 "V6",
             ]
         elif n_sig == 3:
+            # MARS export 3채널의 파일 채널 순서. 원본 .hea 에는 이름이 없지만
+            # 전 코호트(PSVT/TOF/LQT)에서 V5, V1, II 순서임을 확인했다 (2026-09-17).
             record.sig_name = ["V5", "V1", "II"]
         else:
             record.sig_name = [f"lead{i}" for i in range(n_sig)]
