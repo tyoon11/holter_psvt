@@ -128,18 +128,41 @@ def _find_near(basename, roots, max_depth=3):
     return None
 
 
-def autodetect_id(df_clin, keys_by_kind, min_rate=0.05):
-    """임상 CSV 에서 record 와 가장 잘 매칭되는 (컬럼, 매칭대상) 조합을 찾는다."""
-    best = None
+RECORD_KINDS = ("record_name", "file_stem")
+
+
+def autodetect_id(df_clin, keys_by_kind, min_rate=0.05, verbose=True):
+    """임상 CSV 에서 조인 키 (컬럼, 매칭대상) 를 고른다.
+
+    record 단위 키(record_name/file_stem)가 의미 있게 맞으면 pid 보다 우선한다.
+    일치율만 보면 pid 가 이기기 쉬운데(한 환자의 여러 행이 전부 맞으므로), CSV 의
+    pid 가 병원 PID 가 아닌 연구 번호일 수도 있어 위험하다. 실제로 clinical_data_tof.csv
+    는 pid 80.6% / base_name 9.7% 로 pid 가 선택됐지만 base_name 이 정확한 키였다.
+    """
+    cands = []
+    # record 단위 키로 인정할 최소 고유 일치 수: 50, 단 manifest 가 작으면 그 10%
+    n_rec = max((len(v) for k, v in keys_by_kind.items() if k in RECORD_KINDS), default=0)
+    rec_min = max(1, min(50, int(0.1 * n_rec)))
     for col in df_clin.columns:
         vals = df_clin[col].astype(str).str.strip()
         if vals.nunique() < 2:
             continue
         for kind, keyset in keys_by_kind.items():
-            rate = vals.isin(keyset).mean()
-            if rate >= min_rate and (best is None or rate > best[2]):
-                best = (col, kind, rate)
-    return best
+            hit = vals.isin(keyset)
+            rate = hit.mean()
+            if rate >= min_rate or (kind in RECORD_KINDS and vals[hit].nunique() >= rec_min):
+                cands.append((col, kind, rate, int(vals[hit].nunique())))
+    if not cands:
+        return None
+    if verbose:
+        print("  조인 키 후보:  " + "   ".join(
+            f"{c}↔{k} {r:.1%}(고유 {n:,})" for c, k, r, n in sorted(cands, key=lambda x: -x[3])[:6]))
+    rec = [c for c in cands if c[1] in RECORD_KINDS and c[3] >= rec_min]
+    pool = rec if rec else cands
+    col, kind, rate, _ = max(pool, key=lambda x: (x[3], x[2]))
+    if rec and any(c[1] == "pid" for c in cands):
+        print(f"  → record 단위 키 '{col}' 를 우선 사용 (pid 조인이 필요하면 name=path:컬럼:pid 로 지정)")
+    return col, kind, rate
 
 
 def main():
@@ -300,7 +323,11 @@ def main():
             columns={"record": "record_name", "group": "dup_group", "keep": "dup_keep",
                      "note": "dup_note"})
         df = df.merge(dup, how="left", on="record_name")
-        df["dup_keep"] = df["dup_keep"].fillna(True).astype(bool)   # 중복 아닌 것은 keep
+        df["dup_keep"] = df["dup_keep"].map(lambda v: True if pd.isna(v) else bool(v))  # 비중복은 keep
+        # 같은 신호에 다른 PID 가 붙은 묶음은 어느 쪽 라벨이 맞는지 알 수 없다 → 지도학습 평가에서 제외 권장
+        df["dup_pid_conflict"] = df["dup_note"].fillna("").str.contains("PID 불일치")
+        print(f"  같은 신호에 다른 PID(dup_pid_conflict): {int(df['dup_pid_conflict'].sum())}개 record "
+              f"— 라벨 확인 전까지 지도학습에서 제외 권장")
         n_drop = int((~df["dup_keep"]).sum())
         print(f"\n[duplicates] 중복 묶음 {df['dup_group'].nunique():,}개, "
               f"제외 대상 {n_drop:,}개 → 학습에는 dup_keep==True 만 사용")
@@ -321,10 +348,11 @@ def main():
     print("\n" + "=" * 70)
     print("요약")
     print("=" * 70)
-    if "source" in df:
+    grp = "cohort" if "cohort" in df else "source"
+    if grp in df:
         print("  코호트별:")
-        for s, n in df["source"].value_counts().items():
-            sub = df[df["source"] == s]
+        for s, n in df[grp].value_counts().items():
+            sub = df[df[grp] == s]
             print(f"    {s:28s} {n:>6,}개  "
                   f"{sub['duration_h'].sum():>9,.0f}h  "
                   f"beat 보유 {int(sub['has_beats'].astype(bool).sum()):,}")
@@ -335,6 +363,10 @@ def main():
         short = (d < 12).sum()
         if short:
             print(f"    12시간 미만 {short:,}개 — 학습 제외 검토")
+    if "dup_keep" in df:
+        keep = df[df["dup_keep"]]
+        print(f"  중복 제외 후: {len(keep):,} record / 환자 {keep['pid'].nunique():,}"
+              f"  (코호트별 " + ", ".join(f"{k} {v:,}" for k, v in keep[grp].value_counts().items()) + ")")
     for c in ("contiguous", "has_beats", "has_report"):
         if c in df:
             print(f"  {c}: {int(df[c].astype(bool).sum()):,}/{len(df):,}")
