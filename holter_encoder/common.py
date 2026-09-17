@@ -143,22 +143,39 @@ def param_groups(model, lr, weight_decay, ssm_lr=None):
 
 
 class CSVLogger:
+    """행마다 컬럼이 달라도 잃지 않는 CSV 로거.
+
+    예전 구현은 첫 행으로 헤더를 고정하고 extrasaction="ignore" 를 써서, 나중에 나오는
+    val 행(val_rec/val_beat)의 값이 통째로 버려졌다(로그에 빈 칸만 남았다). 새 컬럼이
+    나오면 파일을 다시 쓰고 헤더를 갱신한다.
+    """
+
     def __init__(self, path, enabled=True):
-        self.path, self.enabled, self.cols = path, enabled, None
+        self.path, self.enabled = path, enabled
+        self.cols, self.rows = [], []
         self.t0 = time.time()
 
     def log(self, row):
         if not self.enabled:
             return
         row = {"time_s": round(time.time() - self.t0, 1), **row}
-        new = not os.path.exists(self.path)
-        if self.cols is None:
-            self.cols = list(row)
-        with open(self.path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=self.cols, extrasaction="ignore")
-            if new:
-                w.writeheader()
-            w.writerow(row)
+        new_cols = [c for c in row if c not in self.cols]
+        self.rows.append(row)
+        if new_cols:                       # 컬럼이 늘면 전체를 다시 쓴다 (드물게 일어난다)
+            self.cols += new_cols
+            self._rewrite()
+        else:
+            with open(self.path, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=self.cols).writerow(row)
+
+    def _rewrite(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=self.cols)
+            w.writeheader()
+            for r in self.rows:
+                w.writerow(r)
+        os.replace(tmp, self.path)
 
 
 def autocast(device, enabled=True):

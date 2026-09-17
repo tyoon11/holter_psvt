@@ -129,6 +129,7 @@ def main():
         print(f"  CPU {n_cpu}코어 / 프로세스 {total_proc}개 (rank {world} × worker {args.workers})"
               + ("   ** 코어보다 많습니다. --workers 를 줄이세요 **" if total_proc > n_cpu else ""))
     t0, seen = time.time(), 0
+    ema = {}          # 스텝별 손실은 어떤 record 가 걸렸는지에 따라 크게 흔들린다
     model.train()
     while step < args.steps:
         ds.set_epoch(epoch)
@@ -153,9 +154,13 @@ def main():
                 lb_ = all_reduce_mean(l_beat.detach(), world).item()
                 if main_proc:
                     el = time.time() - t0
-                    print(f"  step {step:>6}/{args.steps}  rec {lr_:.4f}  beat {lb_:.4f}  "
+                    for k, v in (("rec", lr_), ("beat", lb_)):
+                        ema[k] = v if k not in ema else 0.9 * ema[k] + 0.1 * v
+                    print(f"  step {step:>6}/{args.steps}  rec {lr_:.4f} (평균 {ema['rec']:.4f})  "
+                          f"beat {lb_:.4f} (평균 {ema['beat']:.4f})  "
                           f"lr {sched.get_last_lr()[0]:.2e}  {seen/el:,.0f} seg/s", flush=True)
                     logger.log({"step": step, "loss_rec": lr_, "loss_beat": lb_,
+                                "loss_rec_ema": ema["rec"], "loss_beat_ema": ema["beat"],
                                 "lr": sched.get_last_lr()[0], "seg_per_s": seen / el})
 
             if main_proc and val_ds is not None and step % args.val_every == 0:
