@@ -19,7 +19,7 @@ import time
 import numpy as np
 import torch
 
-from .common import autocast, cleanup_distributed, is_main, setup_distributed
+from .common import autocast, cleanup_distributed, describe_device, is_main, setup_distributed
 from .data import iter_segments, load_records, token_paths
 from .model import BeatCNNStem
 
@@ -30,10 +30,12 @@ def main():
     ap.add_argument("--stem", required=True, help="train_stage_a 의 stem.pt")
     ap.add_argument("--out", required=True)
     ap.add_argument("--chunk", type=int, default=1024, help="한 번에 stem 에 넣는 세그먼트 수")
+    ap.add_argument("--gpus", default=None,
+                    help='쓸 GPU 번호, 예: "0,2". torchrun 이면 rank 마다 하나씩 배정')
     ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
-    rank, world, device = setup_distributed()
+    rank, world, device = setup_distributed(args.gpus)
     os.makedirs(args.out, exist_ok=True)
     ck = torch.load(args.stem, map_location="cpu", weights_only=False)
     stem = BeatCNNStem(3, ck["d_model"]).to(device).eval()
@@ -43,7 +45,7 @@ def main():
     recs = sorted(recs, key=lambda r: r["record"])[rank::world]
     todo = [r for r in recs if not os.path.exists(token_paths(args.out, r["record"])[0])]
     if is_main(rank):
-        print(f"[cache] rank0 담당 {len(recs):,} / 남은 {len(todo):,}  (world={world}, d={ck['d_model']})")
+        print(f"[cache] rank0 담당 {len(recs):,} / 남은 {len(todo):,}  (world={world}, d={ck['d_model']}, {describe_device(device)})")
 
     t0 = time.time()
     for i, r in enumerate(todo):

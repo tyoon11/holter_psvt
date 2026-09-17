@@ -20,7 +20,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from .common import (CSVLogger, all_reduce_mean, autocast, cleanup_distributed, cosine_with_warmup,
-                     is_main, load_checkpoint, param_groups, save_checkpoint, setup_distributed, unwrap)
+                     describe_device, is_main, load_checkpoint, param_groups, save_checkpoint,
+                     setup_distributed, unwrap)
 from .data import TokenDataset, load_records
 from .ssl import StageBModel
 
@@ -44,8 +45,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--block", choices=["s4", "mamba"], default="s4",
                     help="backbone 블록: s4(S4D, 시간 불변) | mamba(양방향 선택적 SSM, mamba-ssm 권장)")
-    ap.add_argument("--mid-block", choices=["same", "attn"], default="same",
-                    help="최저 해상도(10분) 블록. attn 이면 self-attention")
+    ap.add_argument("--mid-block", choices=["same", "attn", "mamba", "s4"], default="same",
+                    help="최저 해상도(10분, 24h=144 토큰) 블록. attn=self-attention, "
+                         "mamba=선택적 SSM(토큰이 적어 CUDA 커널 없이도 쓸 만함)")
     ap.add_argument("--mamba-d-state", type=int, default=16)
     ap.add_argument("--d-state", type=int, default=64)
     ap.add_argument("--depths", type=int, nargs=5, default=[2, 4, 4, 2, 2])
@@ -63,10 +65,12 @@ def main():
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--ckpt-every", type=int, default=500)
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--gpus", default=None,
+                    help='쓸 GPU 번호, 예: "0,2". torchrun 이면 rank 마다 하나씩 배정')
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    rank, world, device = setup_distributed()
+    rank, world, device = setup_distributed(args.gpus)
     torch.manual_seed(args.seed + rank)
     os.makedirs(args.out, exist_ok=True)
     main_proc = is_main(rank)
@@ -76,7 +80,7 @@ def main():
     val = TokenDataset(load_records(args.splits, "val"), args.tokens, crop=args.crop, random_crop=False)
     if main_proc:
         print(f"[stage B] train {len(ds):,} record (토큰 없음 {ds.missing}) / val {len(val):,}  "
-              f"crop {args.crop}  world={world}")
+              f"crop {args.crop}  world={world}  {describe_device(device)}")
         if ds.missing:
             print("  ** 토큰 캐시가 없는 train record 가 있습니다. cache_tokens 를 먼저 끝내세요. **")
     sampler = DistributedSampler(ds, world, rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None

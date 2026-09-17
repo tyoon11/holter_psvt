@@ -21,7 +21,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from .common import (CSVLogger, all_reduce_mean, autocast, cleanup_distributed, cosine_with_warmup,
-                     is_main, load_checkpoint, param_groups, save_checkpoint, setup_distributed, unwrap)
+                     describe_device, is_main, load_checkpoint, param_groups, save_checkpoint,
+                     setup_distributed, unwrap)
 from .data import SegmentDataset, load_records
 from .ssl import StageAModel
 
@@ -45,10 +46,12 @@ def main():
     ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--ckpt-every", type=int, default=1000)
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--gpus", default=None,
+                    help='쓸 GPU 번호, 예: "0,2". torchrun 이면 rank 마다 하나씩 배정')
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    rank, world, device = setup_distributed()
+    rank, world, device = setup_distributed(args.gpus)
     torch.manual_seed(args.seed + rank)
     os.makedirs(args.out, exist_ok=True)
     main_proc = is_main(rank)
@@ -56,7 +59,7 @@ def main():
     train_recs = load_records(args.splits, "train")
     val_recs = load_records(args.splits, "val")
     if main_proc:
-        print(f"[stage A] train {len(train_recs):,} record / val {len(val_recs):,}  world={world} device={device}")
+        print(f"[stage A] train {len(train_recs):,} record / val {len(val_recs):,}  world={world} device={describe_device(device)}")
 
     ds = SegmentDataset(train_recs, args.epoch_samples, seed=args.seed, rank=rank)
     dl_kw = dict(batch_size=args.batch, num_workers=args.workers, pin_memory=device.type == "cuda",

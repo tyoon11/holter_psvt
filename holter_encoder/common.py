@@ -10,21 +10,46 @@ import torch
 import torch.distributed as dist
 
 
-def setup_distributed():
-    """torchrun 이면 프로세스 그룹을 만들고, 아니면 단일 프로세스. 반환 (rank, world, device)."""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+def setup_distributed(gpus=None):
+    """torchrun 이면 프로세스 그룹을 만들고, 아니면 단일 프로세스. 반환 (rank, world, device).
+
+    gpus: "0,2,3" 처럼 쓸 물리 GPU 번호. 공용 서버에서 남의 작업과 겹치지 않게 고른다.
+      - 단일 프로세스: 해당 GPU 들만 보이게 하고 첫 번째를 쓴다
+      - torchrun: rank 마다 목록에서 하나씩 맡는다 (nproc_per_node 와 개수를 맞출 것)
+    CUDA 컨텍스트가 만들어지기 전에 설정해야 하므로 학습 스크립트 맨 앞에서 호출한다.
+    """
+    ids = [g.strip() for g in str(gpus).split(",") if g.strip()] if gpus else []
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    local = int(os.environ.get("LOCAL_RANK", 0))
+    if ids:
+        if torch.cuda.is_initialized():
+            raise RuntimeError("--gpus 는 CUDA 초기화 전에 적용해야 합니다 (setup_distributed 를 먼저 호출)")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ids[local % len(ids)] if distributed else ",".join(ids)
+
+    if distributed:
         rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-        local = int(os.environ.get("LOCAL_RANK", 0))
+        if ids and world > len(ids):
+            print(f"  ** 경고: --gpus 에 {len(ids)}개인데 프로세스는 {world}개 — GPU 를 공유하게 됩니다 **")
         if torch.cuda.is_available():
-            torch.cuda.set_device(local)
+            # --gpus 를 주면 프로세스마다 GPU 하나만 보이므로 논리 번호는 0
+            index = 0 if ids else local
+            torch.cuda.set_device(index)
             dist.init_process_group("nccl")
-            device = torch.device("cuda", local)
+            device = torch.device("cuda", index)
         else:
             dist.init_process_group("gloo")
             device = torch.device("cpu")
         return rank, world, device
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return 0, 1, device
+
+
+def describe_device(device):
+    if device.type != "cuda":
+        return str(device)
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "전체")
+    return f"{device} ({torch.cuda.get_device_name(device)}, CUDA_VISIBLE_DEVICES={vis})"
 
 
 def cleanup_distributed():

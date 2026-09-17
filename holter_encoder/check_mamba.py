@@ -10,6 +10,8 @@ check_mamba.py — 서버(GPU)에서 mamba_ssm 설치와 참조 구현 일치를
   4) L=8640 (24h 토큰) 에서 속도 비교
 """
 
+import argparse
+import os
 import time
 
 import torch
@@ -18,6 +20,11 @@ from .mamba import HAS_MAMBA_SSM, MambaRef
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gpus", default=None, help='쓸 GPU 번호, 예: "0"')
+    a = ap.parse_args()
+    if a.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = a.gpus
     if not torch.cuda.is_available():
         print("CUDA 없음 — GPU 서버에서 실행하세요."); return
     if not HAS_MAMBA_SSM:

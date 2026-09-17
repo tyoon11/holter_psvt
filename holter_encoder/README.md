@@ -39,22 +39,56 @@ torchrun --nproc_per_node 4 -m holter_encoder.train_stage_b --splits $OUT/splits
 같은 `--out` 으로 다시 실행하면 `last.pt` 에서 이어서 학습한다.
 각 Stage B 는 `encoder.pt` 를 남긴다 (`HolterEncoder` state_dict + config).
 
-## 백본 선택
+## GPU 지정
 
-| `--block` | 특성 |
-|---|---|
-| `s4` | S4D. 시간 불변 필터. 순수 PyTorch, 설치 불필요 |
-| `mamba` | 양방향 선택적 SSM. Δ·B·C 가 입력에 따라 변해 드문 사건 구간을 선택적으로 유지. `mamba-ssm` 필요 |
-| `--mid-block attn` | 10분 해상도(144 토큰)를 self-attention 으로. attention 가중치로 참고한 시간대를 볼 수 있음 |
-
-Mamba 사용 전 확인:
+공용 서버라 쓸 GPU 를 고를 수 있다. 모든 학습/캐시 스크립트가 `--gpus` 를 받는다.
 
 ```bash
-pip install causal-conv1d mamba-ssm --no-build-isolation
-python -m holter_encoder.check_mamba      # 설치, 참조 구현과의 일치, 속도
+python -m holter_encoder.train_stage_a --gpus 2 ...                  # 단일 GPU
+torchrun --nproc_per_node 2 -m holter_encoder.train_stage_a --gpus 1,3 ...   # rank 마다 하나씩
 ```
 
-`mamba-ssm` 이 없으면 순수 PyTorch 참조 구현으로 동작하지만 24h 길이에서는 매우 느리다.
+torchrun 과 함께 쓰면 rank 마다 목록에서 하나씩 맡는다 (`--nproc_per_node` 와 개수를 맞출 것).
+`CUDA_VISIBLE_DEVICES` 를 직접 써도 된다.
+
+## 백본 선택
+
+| 옵션 | 특성 | 커널 필요 |
+|---|---|---|
+| `--block s4` | S4D. 시간 불변 필터. FFT 컨볼루션이라 24h 도 빠르다 | 없음 |
+| `--block mamba` | 전 해상도 양방향 선택적 SSM. Δ·B·C 가 입력에 따라 변해 드문 사건을 골라 유지 | mamba-ssm 필요 |
+| `--block s4 --mid-block mamba` | 10분 해상도(24h=144 토큰)에서만 Mamba. 토큰이 적어 **커널 없이도 쓸 만하다** | 없음 |
+| `--mid-block attn` | 10분 해상도 self-attention. attention 가중치로 참고 시간대를 볼 수 있다 | 없음 |
+
+합성 데이터 CPU 처리량 참고: s4 약 120, s4+mid mamba 58, 전 해상도 mamba 5.7 record/s.
+커널 없이 전 해상도 Mamba 로 24h 를 학습하는 것은 현실적이지 않다.
+
+### mamba-ssm 설치 (사내 프록시 환경)
+
+`pip install mamba-ssm` 은 setup.py 가 GitHub 릴리스에서 wheel 을 받으려다
+`SSL: CERTIFICATE_VERIFY_FAILED (self-signed certificate in certificate chain)` 로 실패한다.
+pip 자체는 통과하므로 아래 순서로 우회한다.
+
+```bash
+# 1) pip 으로 wheel URL 을 직접 설치 (pip 의 TLS 를 타므로 우회됨)
+#    오류 메시지에 찍힌 "Guessing wheel URL" 주소를 그대로 쓴다
+pip install --no-build-isolation   "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu13torch2.11cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+
+# 2) 404 면 그 조합의 wheel 이 없는 것 → 직접 컴파일 (nvcc 필요, 10~40분)
+nvcc --version
+CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE   pip install --no-build-isolation causal-conv1d mamba-ssm
+
+# 3) setup.py 의 다운로드를 살리려면 사내 CA 를 urllib 에도 알려준다
+export SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")
+export REQUESTS_CA_BUNDLE=$SSL_CERT_FILE
+
+# 확인
+python -m holter_encoder.check_mamba --gpus 0
+```
+
+torch 2.11+cu130 처럼 최신 조합은 미리 빌드된 wheel 이 없을 수 있다. 그때는 2) 또는
+`mamba-ssm==2.2.4` 처럼 낮은 버전을 시도한다. 끝내 안 되면 `--block s4 --mid-block mamba`
+로 진행한다.
 
 ## downstream 에서 인코더 불러오기
 
