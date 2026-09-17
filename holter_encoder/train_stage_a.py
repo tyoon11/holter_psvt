@@ -49,7 +49,9 @@ def main():
     ap.add_argument("--max-open", type=int, default=256)
     ap.add_argument("--random-segs", action="store_true",
                     help="record 안에서 세그먼트를 흩어서 읽는다 (기본은 연속 블록 한 번 읽기)")
-    ap.add_argument("--epoch-samples", type=int, default=200_000, help="가상 epoch 크기(GPU 당)")
+    ap.add_argument("--epoch-samples", type=int, default=4_000_000,
+                    help="가상 epoch 크기(GPU 당 세그먼트). 이 단위로 DataLoader 가 재시작되며 "
+                         "워커를 다시 띄우므로 너무 작게 잡지 않는다")
     ap.add_argument("--val-samples", type=int, default=8192)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--val-every", type=int, default=1000)
@@ -77,7 +79,8 @@ def main():
         print("  ** --meta-dir 없이 돌리면 샘플마다 h5 를 열어 매우 느립니다. "
               "python -m holter_encoder.prep_meta 를 먼저 실행하세요 **")
     dl_kw = dict(batch_size=args.batch, num_workers=args.workers, pin_memory=device.type == "cuda",
-                 drop_last=True, persistent_workers=False)
+                 drop_last=True, persistent_workers=False,
+                 prefetch_factor=4 if args.workers > 0 else None)
     val_ds = SegmentDataset(val_recs, args.val_samples, seed=12345, rank=0, **dskw) if val_recs else None
 
     model = StageAModel(d_model=args.d_model).to(device)
@@ -99,7 +102,13 @@ def main():
         print(f"  파라미터 {n/1e6:.2f}M (stem {sum(p.numel() for p in unwrap(model).stem.parameters())/1e6:.2f}M)")
 
     use_amp = not args.no_amp
-    epoch = step // max(1, args.epoch_samples // args.batch)
+    steps_per_epoch = max(1, args.epoch_samples // max(1, args.segs_per_record) // args.batch)
+    epoch = step // steps_per_epoch
+    if main_proc:
+        print(f"  GPU 당 배치 {args.batch} record × {args.segs_per_record} 세그먼트 = "
+              f"{args.batch * args.segs_per_record:,} 세그먼트/스텝 "
+              f"(전체 {args.batch * args.segs_per_record * world:,})")
+        print(f"  DataLoader 재시작 주기: {steps_per_epoch:,} step")
     t0, seen = time.time(), 0
     model.train()
     while step < args.steps:
@@ -135,7 +144,8 @@ def main():
                 tot_r = tot_b = n = 0
                 g = torch.Generator(device="cpu").manual_seed(0)
                 with torch.no_grad():
-                    for vb in DataLoader(val_ds, batch_size=args.batch, num_workers=args.workers):
+                    for vb in DataLoader(val_ds, batch_size=args.batch,
+                                         num_workers=min(4, args.workers)):
                         with autocast(device, use_amp):
                             r, b = m(vb["x"].flatten(0, 1).to(device), vb["beat"].flatten(0, 1).to(device),
                                      vb["beat_mask"].flatten(0, 1).to(device),
