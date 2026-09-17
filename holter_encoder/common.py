@@ -10,6 +10,26 @@ import torch
 import torch.distributed as dist
 
 
+def limit_cpu_threads(n=1):
+    """워커·랭크가 많을 때 numpy/OpenBLAS 가 프로세스마다 스레드를 띄워 서로 잡아먹는 것을 막는다.
+    torch/numpy import 전에 환경변수를 잡아야 효과가 있으므로 학습 스크립트 맨 앞에서 부른다."""
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(k, str(n))
+    torch.set_num_threads(n)
+
+
+def cpu_count():
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def worker_init(_):
+    torch.set_num_threads(1)
+
+
 def setup_distributed(gpus=None):
     """torchrun 이면 프로세스 그룹을 만들고, 아니면 단일 프로세스. 반환 (rank, world, device).
 

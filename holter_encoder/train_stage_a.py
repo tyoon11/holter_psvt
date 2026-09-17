@@ -21,10 +21,24 @@ import torch
 from torch.utils.data import DataLoader
 
 from .common import (CSVLogger, all_reduce_mean, autocast, cleanup_distributed, cosine_with_warmup,
-                     describe_device, is_main, load_checkpoint, param_groups, save_checkpoint,
-                     setup_distributed, unwrap)
+                     cpu_count, describe_device, is_main, limit_cpu_threads, load_checkpoint,
+                     param_groups, save_checkpoint, setup_distributed, unwrap, worker_init)
 from .data import SegmentDataset, load_records
 from .ssl import StageAModel
+
+
+def to_signal(batch, device, clip):
+    """워커가 보낸 int16 (B, K, C, L) 을 GPU 에서 정규화·clip 하고 (B*K, C, L) 로 편다.
+
+    int16 로 보내면 전송량이 절반이고, 변환·clip 연산도 워커(CPU) 대신 GPU 가 맡는다.
+    """
+    x = batch["x"].to(device, non_blocking=True)
+    if x.dtype != torch.float32:
+        g = batch["gain"].to(device, non_blocking=True)          # (B, C)
+        x = x.float() * g[:, None, :, None]
+        if clip:
+            x = x.clamp_(-clip, clip)
+    return x.flatten(0, 1)
 
 
 def main():
@@ -62,6 +76,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    limit_cpu_threads(1)
     rank, world, device = setup_distributed(args.gpus)
     torch.manual_seed(args.seed + rank)
     os.makedirs(args.out, exist_ok=True)
@@ -79,7 +94,7 @@ def main():
         print("  ** --meta-dir 없이 돌리면 샘플마다 h5 를 열어 매우 느립니다. "
               "python -m holter_encoder.prep_meta 를 먼저 실행하세요 **")
     dl_kw = dict(batch_size=args.batch, num_workers=args.workers, pin_memory=device.type == "cuda",
-                 drop_last=True, persistent_workers=False,
+                 drop_last=True, persistent_workers=False, worker_init_fn=worker_init,
                  prefetch_factor=4 if args.workers > 0 else None)
     val_ds = SegmentDataset(val_recs, args.val_samples, seed=12345, rank=0, **dskw) if val_recs else None
 
@@ -109,6 +124,10 @@ def main():
               f"{args.batch * args.segs_per_record:,} 세그먼트/스텝 "
               f"(전체 {args.batch * args.segs_per_record * world:,})")
         print(f"  DataLoader 재시작 주기: {steps_per_epoch:,} step")
+        n_cpu = cpu_count()
+        total_proc = args.workers * world + world
+        print(f"  CPU {n_cpu}코어 / 프로세스 {total_proc}개 (rank {world} × worker {args.workers})"
+              + ("   ** 코어보다 많습니다. --workers 를 줄이세요 **" if total_proc > n_cpu else ""))
     t0, seen = time.time(), 0
     model.train()
     while step < args.steps:
@@ -116,8 +135,8 @@ def main():
         for batch in DataLoader(ds, shuffle=False, **dl_kw):
             if step >= args.steps:
                 break
-            # (B, K, C, L) → (B*K, C, L)
-            x = batch["x"].flatten(0, 1).to(device, non_blocking=True)
+            # (B, K, C, L) int16 → GPU 에서 물리 단위 변환 (워커→학습 전송량 절반)
+            x = to_signal(batch, device, args.clip)
             beat = batch["beat"].flatten(0, 1).to(device, non_blocking=True)
             bmask = batch["beat_mask"].flatten(0, 1).to(device, non_blocking=True)
             with autocast(device, use_amp):
@@ -147,7 +166,8 @@ def main():
                     for vb in DataLoader(val_ds, batch_size=args.batch,
                                          num_workers=min(4, args.workers)):
                         with autocast(device, use_amp):
-                            r, b = m(vb["x"].flatten(0, 1).to(device), vb["beat"].flatten(0, 1).to(device),
+                            r, b = m(to_signal(vb, device, args.clip),
+                                     vb["beat"].flatten(0, 1).to(device),
                                      vb["beat_mask"].flatten(0, 1).to(device),
                                      mask_ratio=args.mask_ratio, generator=g)
                         tot_r += r.item(); tot_b += b.item(); n += 1

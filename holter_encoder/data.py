@@ -191,13 +191,25 @@ class _Rec:
         self.has_beats = "beat" in self.f
         self._bt = None
 
-    def segments(self, start, count, clip=None):
-        """(count, C, seg_len) float32, 정규화 완료"""
+    @property
+    def gain(self):
+        """int16 원값 → 정규화된 물리 단위로 바꾸는 채널별 계수."""
+        return (self.scale / self.norm).astype(np.float32)
+
+    def segments(self, start, count, clip=None, raw=False):
+        """(count, C, seg_len). raw=True 면 int16 원값 그대로 (GPU 에서 변환).
+
+        워커가 float32 로 바꿔 보내면 전송량이 2배가 된다 (int16 2바이트 vs float32 4바이트).
+        학습 경로는 raw=True 로 받아 GPU 에서 gain 을 곱하고 clip 한다.
+        """
         a, b = start * self.seg_len, (start + count) * self.seg_len
-        x = np.asarray(self.sig[a:b]).astype(np.float32) * self.scale / self.norm   # (T, C)
+        x = np.asarray(self.sig[a:b])                                   # (T, C)
+        if raw and x.dtype == np.int16:
+            return np.ascontiguousarray(x.reshape(count, self.seg_len, -1).transpose(0, 2, 1))
+        x = x.astype(np.float32) * self.gain
         if clip:
             np.clip(x, -clip, clip, out=x)
-        return x.reshape(count, self.seg_len, -1).transpose(0, 2, 1)
+        return np.ascontiguousarray(x.reshape(count, self.seg_len, -1).transpose(0, 2, 1))
 
     def beat_target(self, seg):
         if not self.has_beats:
@@ -267,13 +279,14 @@ class SegmentDataset(Dataset):
     """
 
     def __init__(self, records, samples_per_epoch=200_000, seed=0, rank=0, max_open=256,
-                 meta_dir=None, segs_per_item=1, clip=20.0, contiguous=True):
+                 meta_dir=None, segs_per_item=1, clip=20.0, contiguous=True, raw=True):
         self.records = records
         self.segs = max(1, int(segs_per_item))
         self.n = max(1, samples_per_epoch // self.segs)
         self.seed, self.rank, self.epoch = seed, rank, 0
         self.clip = clip
         self.contiguous = contiguous
+        self.raw = raw
         self.h = _Handles(max_open, meta_dir)
         w = np.array([max(1.0, r.get("n_seg_hint", 8640)) for r in records], np.float64)
         self.p = w / w.sum()
@@ -293,7 +306,7 @@ class SegmentDataset(Dataset):
                 break
         if not len(r.valid_idx):
             segs = np.zeros(self.segs, int)
-            xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
+            xs = np.stack([r.segments(int(s), 1, self.clip, self.raw)[0] for s in segs])
         elif self.contiguous and self.segs > 1:
             # 흩어진 K 번 읽기 대신 연속 블록 한 번 읽기. 디스크 랜덤 접근이 K 배 줄어든다
             # (서버에서 GPU util 10~14%, 초당 40MB 수준으로 IO 에 묶였다).
@@ -301,7 +314,7 @@ class SegmentDataset(Dataset):
             lo = int(rng.choice(r.valid_idx))
             start = min(max(0, lo - int(rng.integers(0, self.segs))), max(0, r.n_seg - self.segs))
             count = min(self.segs, r.n_seg - start)
-            block = r.segments(start, count, self.clip)
+            block = r.segments(start, count, self.clip, self.raw)
             idx = np.arange(start, start + count)
             keep = r.valid[start:start + count]
             if keep.any():                       # 블록 안의 무효 세그먼트는 유효한 것으로 대체
@@ -310,9 +323,10 @@ class SegmentDataset(Dataset):
             xs, segs = block[take], idx[take]
         else:
             segs = rng.choice(r.valid_idx, self.segs, replace=len(r.valid_idx) < self.segs)
-            xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
+            xs = np.stack([r.segments(int(s), 1, self.clip, self.raw)[0] for s in segs])
         bt, bm = zip(*(r.beat_target(int(s)) for s in segs))
-        return {"x": torch.from_numpy(xs),                       # (K, C, L)
+        return {"x": torch.from_numpy(xs),                       # (K, C, L) int16 또는 float32
+                "gain": torch.from_numpy(r.gain),                # (C,) int16 → 물리 단위
                 "beat": torch.from_numpy(np.stack(bt)),          # (K, 5)
                 "beat_mask": torch.tensor(bm, dtype=torch.float32)}
 
