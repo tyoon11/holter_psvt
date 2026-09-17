@@ -101,7 +101,8 @@ class TimeOfDayEmbedding(nn.Module):
     """토큰마다 '하루 중 언제인가'를 sin/cos 로 주입한다.
 
     심박은 circadian 구조가 매우 강해서(수면 중 서맥, 주간 활동성 빈맥) 절대 시각이
-    유용한 사전 정보다. base_datetime 은 h5 metadata 에 이미 들어있다.
+    유용한 사전 정보다. 기준은 .json 의 hookup_time 이다 (.hea 의 base_time 은 MARS 에서
+    내보낸 시각이라 촬영 시각과 일치하지 않음을 서버 데이터에서 확인).
     """
 
     def __init__(self, d_model, n_freq=6):
@@ -110,10 +111,13 @@ class TimeOfDayEmbedding(nn.Module):
         self.proj = nn.Linear(2 * n_freq, d_model)
 
     def forward(self, tod):
-        # tod: (B, S) — 0..1 로 정규화된 하루 중 시각
+        # tod: (B, S) — 0..1 로 정규화된 하루 중 시각. NaN 은 "시각 모름"(.json 없는 record 등)
+        #      이며 그 위치의 임베딩은 0 이 된다.
+        valid = torch.isfinite(tod).unsqueeze(-1).to(self.proj.weight.dtype)
+        tod = torch.nan_to_num(tod, nan=0.0)
         k = torch.arange(1, self.n_freq + 1, device=tod.device, dtype=tod.dtype)
         ang = 2 * math.pi * tod.unsqueeze(-1) * k       # (B, S, n_freq)
-        return self.proj(torch.cat([ang.sin(), ang.cos()], dim=-1))
+        return self.proj(torch.cat([ang.sin(), ang.cos()], dim=-1)) * valid
 
 
 class HierarchicalS4(nn.Module):
@@ -132,14 +136,33 @@ class HierarchicalS4(nn.Module):
     """
 
     def __init__(self, d_model=256, d_state=64, depths=(2, 4, 4, 2, 2),
-                 pool_factors=(6, 10), dropout=0.1, bidirectional=True):
+                 pool_factors=(6, 10), dropout=0.1, bidirectional=True,
+                 block="s4", mid_block=None, mamba_d_state=16):
+        """
+        block     : "s4" (S4D, 시간 불변) | "mamba" (양방향 선택적 SSM, holter_encoder/mamba.py)
+        mid_block : None 이면 최저 해상도도 block 을 쓴다. "attn" 이면 최저 해상도(L2)를
+                    self-attention 블록으로 바꾼다 (24h 기준 144 토큰이라 비용이 작다).
+        """
         super().__init__()
         self.pool_factors = pool_factors
-        mk = lambda n: nn.ModuleList(
-            [S4Block(d_model, d_state=d_state, dropout=dropout,
-                     bidirectional=bidirectional) for _ in range(n)]
-        )
-        self.enc0, self.enc1, self.mid, self.dec1, self.dec0 = (mk(n) for n in depths)
+        self.block, self.mid_block = block, mid_block
+
+        def make(kind):
+            if kind == "s4":
+                return lambda: S4Block(d_model, d_state=d_state, dropout=dropout,
+                                       bidirectional=bidirectional)
+            if kind == "mamba":
+                from .mamba import MambaBlock
+                return lambda: MambaBlock(d_model, d_state=mamba_d_state, dropout=dropout)
+            if kind == "attn":
+                from .mamba import MidAttentionBlock
+                return lambda: MidAttentionBlock(d_model, dropout=dropout)
+            raise ValueError(f"알 수 없는 블록: {kind}")
+
+        mk = lambda n, kind: nn.ModuleList([make(kind)() for _ in range(n)])
+        self.enc0, self.enc1 = mk(depths[0], block), mk(depths[1], block)
+        self.mid = mk(depths[2], mid_block or block)
+        self.dec1, self.dec0 = mk(depths[3], block), mk(depths[4], block)
 
         p0, p1 = pool_factors
         self.down0 = nn.Conv1d(d_model, d_model, p0, stride=p0)
@@ -220,10 +243,13 @@ class HolterEncoder(nn.Module):
 
     def __init__(self, in_channels=3, d_model=256, d_state=64,
                  depths=(2, 4, 4, 2, 2), pool_factors=(6, 10),
-                 dropout=0.1, seg_chunk=512, use_time_of_day=True):
+                 dropout=0.1, seg_chunk=512, use_time_of_day=True,
+                 block="s4", mid_block=None, mamba_d_state=16):
         super().__init__()
         self.stem = BeatCNNStem(in_channels, d_model, dropout=dropout)
-        self.backbone = HierarchicalS4(d_model, d_state, depths, pool_factors, dropout)
+        self.backbone = HierarchicalS4(d_model, d_state, depths, pool_factors, dropout,
+                                       block=block, mid_block=mid_block,
+                                       mamba_d_state=mamba_d_state)
         self.pool = AttentionPool(d_model)
         self.tod = TimeOfDayEmbedding(d_model) if use_time_of_day else None
         self.d_model = d_model
