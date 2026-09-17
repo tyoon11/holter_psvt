@@ -126,6 +126,8 @@ def main():
     ap.add_argument("--clinical", nargs="*", default=[],
                     help="name=path 형식. 예: psvt=/.../clinical_data_psvt.csv")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--duplicates", default=None,
+                    help="find_duplicates.py 결과 CSV. dup_group / dup_keep 컬럼을 붙인다")
     args = ap.parse_args()
 
     files = []
@@ -191,6 +193,22 @@ def main():
         assert len(df) == before, "조인으로 행이 늘었습니다 (중복 ID 확인 필요)"
         matched = df[[c for c in df.columns if c.startswith(f"{name}_")]].notna().any(axis=1).sum()
         print(f"  manifest 측 매칭: {matched:,}/{len(df):,} record")
+
+    # ---- 신호 중복 표시 ----
+    if args.duplicates:
+        dup = pd.read_csv(args.duplicates, dtype={"record": str})
+        # 같은 이름이 여러 행이면(이름까지 같은 중복) 하나라도 keep 이면 keep
+        dup["keep"] = dup["keep"].astype(str).str.lower().eq("true")
+        dup = (dup.groupby("record", as_index=False)
+                  .agg(group=("group", "first"), keep=("keep", "any"), note=("note", "first")))
+        dup = dup[["record", "group", "keep", "note"]].rename(
+            columns={"record": "record_name", "group": "dup_group", "keep": "dup_keep",
+                     "note": "dup_note"})
+        df = df.merge(dup, how="left", on="record_name")
+        df["dup_keep"] = df["dup_keep"].fillna(True).astype(bool)   # 중복 아닌 것은 keep
+        n_drop = int((~df["dup_keep"]).sum())
+        print(f"\n[duplicates] 중복 묶음 {df['dup_group'].nunique():,}개, "
+              f"제외 대상 {n_drop:,}개 → 학습에는 dup_keep==True 만 사용")
 
     # ---- 저장 ----
     out = args.out
