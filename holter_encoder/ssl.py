@@ -17,6 +17,8 @@ Stage B (StageBModel): 캐시 토큰 시퀀스에 대한 계층형 S4 사전학�
   - 파라미터 이름(backbone., tod.)은 model.HolterEncoder 와 같아 그대로 옮겨 쓸 수 있다
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,19 +28,33 @@ from .model import BeatCNNStem, HierarchicalS4, TimeOfDayEmbedding
 
 
 def span_mask(B, L, ratio, span_min, span_max, device, valid=None, generator=None):
-    """(B, L) bool, True = 가림. valid(True=가릴 수 있음) 안에서 ratio 만큼 구간으로 채운다."""
-    mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-    for b in range(B):
-        n_valid = int(valid[b].sum()) if valid is not None else L
-        target = int(round(ratio * n_valid))
-        tries = 0
-        while int(mask[b].sum()) < target and tries < 1000:
-            tries += 1
-            span = int(torch.randint(span_min, span_max + 1, (1,), generator=generator))
-            st = int(torch.randint(0, max(1, L - span + 1), (1,), generator=generator))
-            mask[b, st:st + span] = True
-        if valid is not None:
-            mask[b] &= valid[b]
+    """(B, L) bool, True = 가림. 구간 여러 개를 겹쳐 대략 ratio 만큼 덮는다.
+
+    예전 구현은 샘플마다 while 문으로 구간을 추가하면서 int(mask[b].sum()) 으로 진행도를
+    확인했다. 이 한 줄이 반복마다 GPU→CPU 동기화를 일으켜, 배치 2,048 이면 스텝당 1만 번
+    동기화가 발생했다 (서버에서 로더는 395,891 seg/s 를 내는데 학습은 6,661 seg/s).
+    지금은 시작점·길이를 한 번에 뽑고 +1/-1 누적합으로 구간을 칠한다. 동기화도 파이썬
+    반복도 없다.
+
+    구간 수는 겹침을 감안해 기대 커버리지가 ratio 가 되도록 정한다:
+      coverage = 1 - (1 - E[len]/L)^n  →  n = log(1-ratio) / log(1 - E[len]/L)
+    """
+    mean_len = (span_min + span_max) / 2.0
+    q = max(1e-6, min(1 - 1e-6, mean_len / L))
+    n_spans = max(1, int(math.ceil(math.log(max(1e-6, 1 - ratio)) / math.log(1 - q))))
+
+    dev = device if (generator is None or generator.device.type == device.type) else torch.device("cpu")
+    starts = torch.randint(0, L, (B, n_spans), device=dev, generator=generator)
+    lens = torch.randint(span_min, span_max + 1, (B, n_spans), device=dev, generator=generator)
+    ends = (starts + lens).clamp_(max=L)
+    diff = torch.zeros(B, L + 1, dtype=torch.int32, device=dev)
+    ones = torch.ones_like(starts, dtype=torch.int32)
+    diff.scatter_add_(1, starts, ones)
+    diff.scatter_add_(1, ends, -ones)
+    mask = diff.cumsum(1)[:, :L] > 0
+    mask = mask.to(device)
+    if valid is not None:
+        mask &= valid
     return mask
 
 
