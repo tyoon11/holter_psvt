@@ -44,6 +44,7 @@ def convert_one_record(
     use_dummy_fiducial=True,
     use_dummy_similarity=True,
     output_dir=None,
+    extra_attrs=None,
 ):
     record_name = os.path.splitext(os.path.basename(record_path))[0]
     record_path_no_ext = os.path.splitext(record_path)[0]
@@ -111,7 +112,7 @@ def convert_one_record(
         }
         if output_dir is None:
             return payload
-        return write_record(payload, output_dir)
+        return write_record(payload, output_dir, extra_attrs)
 
     except Exception as e:
         logging.exception(f"[❌ EXCEPTION] {record_name} - {e}")
@@ -145,12 +146,15 @@ def build_writer_kwargs(data):
     )
 
 
-def write_record(data, output_dir):
-    """payload 를 파일로 쓰고 작은 요약만 반환한다."""
+def write_record(data, output_dir, extra_attrs=None):
+    """payload 를 파일로 쓰고 작은 요약만 반환한다.
+
+    extra_attrs 는 v2 root attr 로 들어간다 (예: cohort, raw_path).
+    """
     h5_path = os.path.join(output_dir, f"{data['record_name']}.h5")
     kw = build_writer_kwargs(data)
     if USE_V2:
-        create_h5_structure_v2(h5_path, **kw)
+        create_h5_structure_v2(h5_path, extra_attrs=extra_attrs, **kw)
     else:
         with h5py.File(h5_path, "w") as h5f:
             create_h5_structure(h5_file=h5f, **kw)

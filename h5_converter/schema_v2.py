@@ -410,6 +410,7 @@ def create_h5_structure_v2(
     record_filename="", patient_id="", age="", gender="",
     signal=None, beat_annotation=None, sig_stats=None, beat_sims=None,
     fiducial_point=None, fiducial_feature=None, metadata=None, annotation_data=None,
+    extra_attrs=None,
 ):
     """create_h5_structure() 와 같은 인자를 받아 v2 로 쓴다.
 
@@ -503,4 +504,5 @@ def create_h5_structure_v2(
         similarity=_stack(beat_sims, ["bs_corr", "bs_dtw"]),
         hea_meta=hea,
         report=flatten_report(annotation_data) if annotation_data else None,
+        extra_attrs=extra_attrs,
     )

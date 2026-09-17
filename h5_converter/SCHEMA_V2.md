@@ -80,49 +80,78 @@ object header 파싱, 개당 수십~수백 µs)가 8,640번 곱해지는 것이 
 
 ## v2 구조 (신규)
 
+아래는 현재 코드(`tools/run_conversion.py`)로 실제 변환한 파일에서 뽑은 구조다.
+24h record(10,350,000 sample, 8,280 세그먼트, beat 약 10만 개) 기준 크기를 함께 적었다.
+
 ```
-/  root attrs — 스칼라는 전부 여기로 올라온다
-   schema_version="2.0", record_name, source, created_by, created_at
-   fs, n_sig, n_samples, n_seg, seg_len, duration_h, dtype="int16"
-   sig_name=["II","V1","V5"]   scale=[s_II, s_V1, s_V5]
-   pid, age, gender, base_date, base_time
-   has_beats, has_fiducial, has_report
-   symbol_table, aux_vocab, fiducial_vocab            ← 코드 → 문자열 사전
-   fiducial_feature_names, quality_names, similarity_names  ← 배열 열 순서
-   ann_len, NoisePercentage, AFAFLPercentage
-   vb_total, vb_Isolated, vb_Couplets, vb_BigeminalCycles,
-   vb_run_count, vb_run_TotalBeats, vb_run_LongestRunBeats, vb_run_LongestRunBPM,
-   vb_run_LongestRunTimestamp, vb_run_FastestRunBeats, vb_run_FastestRunBPM,
-   vb_run_FastestRunTimestamp
-   sb_…  (상심실성, 동일한 12개)
-   PacedBeats_total, BBBeats_total, JunctionalBeats_total, AberrantBeats_total
+/  root attrs
+│  ── 식별 ──
+│  schema_version="2.0", record_name, cohort, raw_path, source="SNUH",
+│  created_at, created_by
+│  ── 신호 ──
+│  fs=125.0, n_sig=3, n_samples, n_seg, seg_len=1250, duration_h, dtype="int16"
+│  sig_name='["II","V1","V5"]'   scale='[s_II, s_V1, s_V5]'        ← JSON 문자열
+│  base_date, base_time                                           ← .hea
+│  ── 환자 ──
+│  pid (파일명 끝 토큰), age, gender                                ← age 는 문자열, .json 없으면 "-1"
+│  ── 상태 플래그 ──
+│  has_beats, has_fiducial, has_report
+│  ── 사전 / 배열 열 이름 ──
+│  symbol_table, aux_vocab, fiducial_feature_names, quality_names, similarity_names
+│  ── .json 리포트 (has_report=True 일 때만) ──
+│  report_pid, report_age, report_gender, report_duration, hookup_date, hookup_time
+│  ann_len, NoisePercentage, AFAFLPercentage                      ← 문자열 ("< 1", "Unknown")
+│  hr_min, hr_min_ts, hr_avg, hr_max, hr_max_ts                    ← JSON 에 있을 때만
+│  tachy_beats, tachy_pct, brady_beats, brady_pct                  ← "Unknown" 은 nan
+│  vb_total, vb_Isolated, vb_Couplets, vb_BigeminalCycles,
+│  vb_run_count, vb_run_TotalBeats, vb_run_{Longest,Fastest}Run{Beats,BPM,Timestamp}
+│  sb_… (상심실성, 동일 12개)
+│  PacedBeats_total, BBBeats_total, JunctionalBeats_total, AberrantBeats_total
 │
-├─ signal   (n_samples, 3) int16   contiguous · 무압축      ← 큰 배열은 이것 하나
+├─ signal            (n_samples, 3)    int16    contiguous   ≈ 62 MB
 │
-├─ beat/
-│  ├─ sample     (n_beats,) int32   ← record 기준 절대 인덱스
-│  ├─ symbol     (n_beats,) uint8   ← WFDB 심볼 코드 (255=미지)
-│  ├─ subtype    (n_beats,) int8
-│  ├─ chan       (n_beats,) int8
-│  ├─ num        (n_beats,) int8
-│  ├─ aux_code   (n_beats,) uint16  ← aux_vocab 인덱스
-│  └─ seg_offset (n_seg+1,) int32   ← CSR: seg i = sample[off[i]:off[i+1]]
+├─ beat/                                                       (has_beats=True 일 때만)
+│  ├─ sample         (n_beats,)        int32    record 기준 절대 인덱스
+│  ├─ symbol         (n_beats,)        uint8    symbol_table[code]
+│  ├─ subtype        (n_beats,)        int8
+│  ├─ chan           (n_beats,)        int8
+│  ├─ num            (n_beats,)        int8
+│  ├─ aux_code       (n_beats,)        uint16   aux_vocab[code]
+│  └─ seg_offset     (n_seg+1,)        int32    seg i = sample[off[i]:off[i+1]]   ≈ 1 MB 합계
 │
-├─ fid/
-│  ├─ sample     (n_fid,) int32
-│  ├─ label      (n_fid,) uint16
-│  └─ seg_offset (n_seg+1,) int32
+├─ fid/                                                        (has_fiducial=True 일 때만)
+│  ├─ sample, label, seg_offset
 │
 ├─ seg/
-│  ├─ fiducial_feat (n_seg, 19) float16
-│  ├─ quality       (n_seg, 5, 3) float16   ← [nan_ratio, amp_mean, amp_std,
-│  │                                            amp_skewness, amp_kurtosis]
-│  └─ similarity    (n_seg, 2, 3) float16   ← [bs_correlation, bs_dtw]
+│  ├─ fiducial_feat  (n_seg, 19)       float16
+│  ├─ quality        (n_seg, 5, 3)     float16  [nan_ratio, amp_mean, amp_std, amp_skewness, amp_kurtosis]
+│  └─ similarity     (n_seg, 2, 3)     float16  [bs_correlation, bs_dtw]
 │
-└─ meta/  [fmt, units]
-   ├─ adc_gain (3,) float32
+└─ meta/  attrs: fmt, units (JSON 문자열)
+   ├─ adc_gain       (3,)              float32
    └─ baseline, adc_res, adc_zero (3,) int32
 ```
+
+record 하나 ≈ **63 MB**, dataset 18개, group 3~4개.
+
+### 입력 상태에 따라 달라지는 것
+
+| 상황 | 결과 |
+|---|---|
+| `.ANN` 없음 | `has_beats=False`, `/beat` 없음 |
+| `.json` 없음 | `has_report=False`, 리포트 attr 전부 없음, `age="-1"`, `gender=""` |
+| 기본(dummy) 모드 | `has_fiducial=False`, `/fid` 없음, `seg/fiducial_feat`·`seg/similarity` 는 **전부 NaN** |
+| `--real-fiducial` | `/fid` 생성, `seg/fiducial_feat` 채워짐 |
+| `--real-similarity` | `seg/similarity` 채워짐 (dtw-python 필요) |
+
+`seg/quality` 는 모드와 무관하게 항상 계산된다.
+리포트 attr 은 `.json` 에 그 필드가 있을 때만 생기므로 record 마다 attr 목록이 다를 수 있다.
+
+### 코호트
+
+`cohort` 는 `--raw` 로 준 디렉토리 아래 첫 디렉토리 이름이다.
+`--raw /home/coder/workspace/data/raw` 이면 `nas1_Holter_PSVT`, `nas1_Holter_TOF_250917`,
+`nas1_Holter_LQT_260615` (하위 `addition_260729` 포함) 중 하나가 된다.
 
 ---
 
@@ -154,6 +183,8 @@ object header 파싱, 개당 수십~수백 µs)가 8,640번 곱해지는 것이 
 | `…/{Paced,BB,Junctional,Aberrant}Beats.attrs[total]` | root attr `*_total` | |
 | — | root attr `n_samples`, `duration_h`, `scale` | 신규 |
 | — | root attr `has_beats/has_fiducial/has_report` | 신규, 필터용 |
+| — | root attr `cohort`, `raw_path` | 신규, 코호트 구분·원본 추적 |
+| .json `HeartRates/*`, `PatientInfo/*` | root attr `hr_*`, `tachy_*`, `brady_*`, `hookup_*`, `report_*` | v1 은 읽지 않았음 |
 | — | `/beat/seg_offset`, `/fid/seg_offset` | 신규, CSR 인덱스 |
 
 **v1에만 있고 v2에 없는 필드는 `extraction_method` 하나뿐**이고, 레코드 내에서 값이

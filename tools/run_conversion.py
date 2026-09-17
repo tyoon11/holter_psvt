@@ -71,6 +71,18 @@ def hea_refs_ok(hea_path, base):
     return True
 
 
+def cohort_of(dirpath, root):
+    """--raw 루트 아래 첫 디렉토리 이름을 코호트로 쓴다.
+
+    --raw data/raw 처럼 코호트들을 담은 상위 디렉토리를 주면
+      data/raw/nas1_Holter_PSVT/X.hea              → nas1_Holter_PSVT
+      data/raw/nas1_Holter_LQT_260615/addition/X.hea → nas1_Holter_LQT_260615
+    --raw 로 코호트 디렉토리를 직접 주면 그 이름이 된다.
+    """
+    rel = os.path.relpath(os.path.abspath(dirpath), os.path.abspath(root))
+    return os.path.basename(os.path.abspath(root)) if rel == "." else rel.split(os.sep)[0]
+
+
 def gather(raw_dirs, require_ann=False, require_json=False):
     """(record_name → hea_path), 제외 사유, 중복, 부가 정보 집계를 만든다."""
     found, skipped, dup = {}, Counter(), []
@@ -109,7 +121,8 @@ def gather(raw_dirs, require_ann=False, require_json=False):
                 if base in found:
                     dup.append((base, found[base][0], os.path.join(dirpath, nm)))
                     continue
-                found[base] = (os.path.join(dirpath, nm), has_ann, has_json)
+                found[base] = (os.path.join(dirpath, nm), has_ann, has_json,
+                               cohort_of(dirpath, root))
                 info["주석+리포트 완비" if has_ann and has_json else
                      ".ANN 없음 (포함)" if not has_ann and has_json else
                      ".json 없음 (포함)" if has_ann else ".ANN·.json 둘 다 없음 (포함)"] += 1
@@ -246,7 +259,7 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
     prog = Progress(len(records))
     log_new = not os.path.exists(log_path)
     logf = open(log_path, "a", newline="")
-    cols = ["time", "record_name", "status", "n_seg", "n_beats", "has_report", "ann_file",
+    cols = ["time", "record_name", "cohort", "status", "n_seg", "n_beats", "has_report", "ann_file",
             "json_file", "leads", "src_leads", "bytes", "sec", "error", "hea"]
     w = csv.DictWriter(logf, fieldnames=cols, extrasaction="ignore")
     if log_new:
@@ -259,10 +272,13 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
         while True:
             while len(pending) < inflight:
                 try:
-                    name, hea, ann_file, json_file = next(it)
+                    name, hea, ann_file, json_file, cohort = next(it)
                 except StopIteration:
                     break
-                h = backend.submit(task_fn, hea, output_dir=out_dir, **task_kw)
+                h = backend.submit(task_fn, hea, output_dir=out_dir,
+                                   extra_attrs={"cohort": cohort,
+                                                "raw_path": os.path.abspath(hea)},
+                                   **task_kw)
                 pending[h] = (name, hea, ann_file, json_file, time.time())
             if not pending:
                 break
@@ -280,6 +296,7 @@ def run(records, out_dir, backend, task_fn, task_kw, inflight, log_path):
                 res["sec"] = round(time.time() - t_sub, 1)
                 res["hea"] = hea
                 res["ann_file"], res["json_file"] = ann_file, json_file
+                res["cohort"] = cohort
                 # .ANN 파일이 있는데 beat 가 0 이면 parse_ann 이 조용히 실패한 것이다
                 if res.get("status") == "ok" and ann_file and not res.get("n_beats"):
                     prog.ann_fail += 1
@@ -348,7 +365,9 @@ def main():
             except OSError:
                 pass
     existing = {e.name[:-3] for e in os.scandir(args.out) if e.name.endswith(".h5")}
-    todo = sorted((n, p, a, j) for n, (p, a, j) in found.items() if n not in existing)
+    todo = sorted((n, p, a, j, c) for n, (p, a, j, c) in found.items() if n not in existing)
+    by_cohort = Counter(c for *_, c in todo)
+    print("  코호트별: " + "  ".join(f"{k} {v:,}" for k, v in by_cohort.most_common()))
     if args.limit:
         todo = todo[: args.limit]
     print(f"  이미 변환됨 {len(found) - len([n for n in found if n not in existing]):,}개"
