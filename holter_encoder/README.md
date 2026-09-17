@@ -134,6 +134,24 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe \
   (합성 검증: 신호를 심어둔 태스크에서 단일 test 0.41 vs CV 0.741 [0.604-0.844]).
 - `--features stem` 으로 돌리면 Stage A stem 만의 표현과 비교되어 Stage B backbone 의 기여를 분리할 수 있다.
 
+## Stage A 가 느릴 때 (GPU util 이 낮을 때)
+
+Stage A 는 IO 에 묶이기 쉽다. 저장소 특성을 먼저 잰다.
+
+```bash
+python tools/io_bench.py --splits $OUT/splits.csv --meta-dir $OUT/segmeta --threads 1 8 32 64
+```
+
+| 관찰 | 조치 |
+|---|---|
+| 연속 블록 ≫ 랜덤 | 랜덤 접근이 병목 → `--segs-per-record` 를 키운다 (16 → 32/64) |
+| threads 를 늘릴수록 seg/s 상승 | 지연이 병목 → `--workers` 를 늘린다 |
+| 둘 다 정체 | 대역폭 한계 → 로컬 NVMe 로 옮기거나, GPU 수를 줄이고 남은 GPU 를 양보한다 |
+
+필요한 처리량 = `GPU 수 × batch × segs-per-record / 목표 스텝 시간`.
+예: 4 GPU × 128 × 16 을 1 초에 처리하려면 8,192 seg/s 가 필요하다.
+저장소가 그만큼 못 내주면 GPU 를 늘려도 소용이 없다.
+
 ## Stage A 배치 계산
 
 `--batch` 는 **record 수**, 실제 세그먼트 수는 `batch × segs-per-record` 다.

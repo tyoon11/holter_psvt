@@ -47,6 +47,8 @@ def main():
                     help="한 번 연 record 에서 뽑는 세그먼트 수 (파일 여는 비용 분할)")
     ap.add_argument("--clip", type=float, default=20.0, help="정규화 후 진폭 clip (아티팩트 완화)")
     ap.add_argument("--max-open", type=int, default=256)
+    ap.add_argument("--random-segs", action="store_true",
+                    help="record 안에서 세그먼트를 흩어서 읽는다 (기본은 연속 블록 한 번 읽기)")
     ap.add_argument("--epoch-samples", type=int, default=200_000, help="가상 epoch 크기(GPU 당)")
     ap.add_argument("--val-samples", type=int, default=8192)
     ap.add_argument("--log-every", type=int, default=50)
@@ -69,7 +71,7 @@ def main():
         print(f"[stage A] train {len(train_recs):,} record / val {len(val_recs):,}  world={world} device={describe_device(device)}")
 
     dskw = dict(meta_dir=args.meta_dir, segs_per_item=args.segs_per_record,
-                clip=args.clip, max_open=args.max_open)
+                clip=args.clip, max_open=args.max_open, contiguous=not args.random_segs)
     ds = SegmentDataset(train_recs, args.epoch_samples, seed=args.seed, rank=rank, **dskw)
     if main_proc and args.meta_dir is None:
         print("  ** --meta-dir 없이 돌리면 샘플마다 h5 를 열어 매우 느립니다. "

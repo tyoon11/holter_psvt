@@ -221,12 +221,13 @@ class SegmentDataset(Dataset):
     """
 
     def __init__(self, records, samples_per_epoch=200_000, seed=0, rank=0, max_open=256,
-                 meta_dir=None, segs_per_item=1, clip=20.0):
+                 meta_dir=None, segs_per_item=1, clip=20.0, contiguous=True):
         self.records = records
         self.segs = max(1, int(segs_per_item))
         self.n = max(1, samples_per_epoch // self.segs)
         self.seed, self.rank, self.epoch = seed, rank, 0
         self.clip = clip
+        self.contiguous = contiguous
         self.h = _Handles(max_open, meta_dir)
         w = np.array([max(1.0, r.get("n_seg_hint", 8640)) for r in records], np.float64)
         self.p = w / w.sum()
@@ -246,9 +247,24 @@ class SegmentDataset(Dataset):
                 break
         if not len(r.valid_idx):
             segs = np.zeros(self.segs, int)
+            xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
+        elif self.contiguous and self.segs > 1:
+            # 흩어진 K 번 읽기 대신 연속 블록 한 번 읽기. 디스크 랜덤 접근이 K 배 줄어든다
+            # (서버에서 GPU util 10~14%, 초당 40MB 수준으로 IO 에 묶였다).
+            # 같은 배치 안에서 몇 분 간격의 세그먼트가 함께 오지만, SSL 에는 문제되지 않는다.
+            lo = int(rng.choice(r.valid_idx))
+            start = min(max(0, lo - int(rng.integers(0, self.segs))), max(0, r.n_seg - self.segs))
+            count = min(self.segs, r.n_seg - start)
+            block = r.segments(start, count, self.clip)
+            idx = np.arange(start, start + count)
+            keep = r.valid[start:start + count]
+            if keep.any():                       # 블록 안의 무효 세그먼트는 유효한 것으로 대체
+                block, idx = block[keep], idx[keep]
+            take = rng.choice(len(idx), self.segs, replace=len(idx) < self.segs)
+            xs, segs = block[take], idx[take]
         else:
             segs = rng.choice(r.valid_idx, self.segs, replace=len(r.valid_idx) < self.segs)
-        xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
+            xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
         bt, bm = zip(*(r.beat_target(int(s)) for s in segs))
         return {"x": torch.from_numpy(xs),                       # (K, C, L)
                 "beat": torch.from_numpy(np.stack(bt)),          # (K, 5)
