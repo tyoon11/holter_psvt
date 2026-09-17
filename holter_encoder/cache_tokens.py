@@ -19,8 +19,8 @@ import time
 import numpy as np
 import torch
 
-from .common import (autocast, cleanup_distributed, describe_device, is_main, limit_cpu_threads,
-                     setup_distributed)
+from .common import (autocast, cleanup_distributed, describe_device, ensure_kernel_cache, is_main,
+                     limit_cpu_threads, setup_distributed)
 from .data import iter_segments, load_records, token_paths
 from .model import BeatCNNStem
 
@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
+    ensure_kernel_cache(args.out if hasattr(args, 'out') else None)
     limit_cpu_threads(2)
     rank, world, device = setup_distributed(args.gpus)
     os.makedirs(args.out, exist_ok=True)

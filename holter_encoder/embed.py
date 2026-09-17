@@ -21,7 +21,8 @@ import time
 import numpy as np
 import torch
 
-from .common import autocast, cleanup_distributed, describe_device, is_main, setup_distributed
+from .common import (autocast, cleanup_distributed, describe_device, ensure_kernel_cache, is_main,
+                     setup_distributed)
 from .data import TokenDataset, load_records
 from .model import HolterEncoder
 
@@ -50,6 +51,7 @@ def main():
     ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
+    ensure_kernel_cache()
     rank, world, device = setup_distributed(args.gpus)
     enc, cfg = build_from_checkpoint(args.encoder, device)
     recs = load_records(args.splits, split=None)

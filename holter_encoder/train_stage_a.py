@@ -21,8 +21,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from .common import (CSVLogger, all_reduce_mean, autocast, cleanup_distributed, cosine_with_warmup,
-                     cpu_count, describe_device, is_main, limit_cpu_threads, load_checkpoint,
-                     param_groups, save_checkpoint, setup_distributed, unwrap, worker_init)
+                     cpu_count, describe_device, ensure_kernel_cache, is_main, limit_cpu_threads,
+                     load_checkpoint, param_groups, save_checkpoint, setup_distributed, unwrap,
+                     worker_init)
 from .data import SegmentDataset, load_records
 from .ssl import StageAModel
 
@@ -76,6 +77,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    ensure_kernel_cache(args.out if hasattr(args, 'out') else None)
     limit_cpu_threads(1)
     rank, world, device = setup_distributed(args.gpus)
     torch.manual_seed(args.seed + rank)

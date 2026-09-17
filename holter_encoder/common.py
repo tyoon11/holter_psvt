@@ -19,6 +19,29 @@ def limit_cpu_threads(n=1):
     torch.set_num_threads(n)
 
 
+def ensure_kernel_cache(preferred=None):
+    """CUDA 커널 캐시를 쓸 수 있는 경로로 돌린다.
+
+    기본 경로(~/.cache/torch/kernels)를 못 만들면 torch 가 캐시를 끄고 매 실행마다
+    커널을 다시 컴파일한다(서버 로그의 "Specified kernel cache directory could not be
+    created" 경고). torch 의 CUDA JIT 이 처음 쓰이기 전에 설정해야 한다.
+    """
+    if os.environ.get("PYTORCH_KERNEL_CACHE_PATH"):
+        return os.environ["PYTORCH_KERNEL_CACHE_PATH"]
+    for cand in (preferred, os.environ.get("TMPDIR"), "/tmp"):
+        if not cand:
+            continue
+        path = os.path.join(cand, f"torch_kernels_{os.environ.get('USER', 'user')}")
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.access(path, os.W_OK):
+                os.environ["PYTORCH_KERNEL_CACHE_PATH"] = path
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def cpu_count():
     try:
         return len(os.sched_getaffinity(0))

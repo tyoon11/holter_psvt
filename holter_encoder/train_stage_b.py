@@ -20,8 +20,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from .common import (CSVLogger, all_reduce_mean, autocast, cleanup_distributed, cosine_with_warmup,
-                     describe_device, is_main, load_checkpoint, param_groups, save_checkpoint,
-                     setup_distributed, unwrap)
+                     describe_device, ensure_kernel_cache, is_main, load_checkpoint, param_groups,
+                     save_checkpoint, setup_distributed, unwrap)
 from .data import TokenDataset, load_records
 from .ssl import StageBModel
 
@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    ensure_kernel_cache()
     rank, world, device = setup_distributed(args.gpus)
     torch.manual_seed(args.seed + rank)
     os.makedirs(args.out, exist_ok=True)
