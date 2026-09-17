@@ -331,6 +331,9 @@ def main():
                     help="neurokit fiducial 추출 수행 (기본은 dummy, 훨씬 빠름)")
     ap.add_argument("--real-similarity", action="store_true",
                     help="beat 유사도(corr/DTW) 계산 수행 (기본은 dummy)")
+    ap.add_argument("--lead-mode", choices=["file", "assumed"], default="file",
+                    help="file: 원본 채널 순서 그대로 ch0,ch1,ch2 로 저장(기본, lead 미확정 상태에 안전) / "
+                         "assumed: utils.py 하드코딩 이름(V5,V1,II)으로 II,V1,V5 재배열")
     ap.add_argument("--log", default=None, help="결과 CSV (기본 <out>/conversion_log.csv)")
     ap.add_argument("--require-ann", action="store_true", help=".ANN 없는 record 제외")
     ap.add_argument("--require-json", action="store_true", help=".json 없는 record 제외")
@@ -391,6 +394,7 @@ def main():
 
     inflight = args.inflight or args.cpus * 2
     print(f"\n[2/3] 변환  backend={args.backend}  cpus={args.cpus}  inflight={inflight}  "
+          f"lead={args.lead_mode}  "
           f"fiducial={'real' if args.real_fiducial else 'dummy'}  "
           f"similarity={'real' if args.real_similarity else 'dummy'}")
     print(f"  로그 {log_path}")
@@ -401,7 +405,11 @@ def main():
 
     task_kw = dict(sampling_rate=125, segment_sec=10, max_segments=None,
                    use_dummy_fiducial=not args.real_fiducial,
-                   use_dummy_similarity=not args.real_similarity)
+                   use_dummy_similarity=not args.real_similarity,
+                   lead_mode=args.lead_mode)
+    if args.lead_mode == "file" and args.real_fiducial:
+        print("  ** 주의: --lead-mode file 에서는 lead 이름이 ch0~2 라 fiducial 추출이 II 를 "
+              "찾지 못한다. fiducial 이 필요하면 lead 확정 후 --lead-mode assumed 로 변환 **")
 
     Backend = RayBackend if args.backend == "ray" else ProcessBackend
     backend = Backend(args.cpus, args.ray_tmp)

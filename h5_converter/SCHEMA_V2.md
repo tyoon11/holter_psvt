@@ -148,6 +148,19 @@ record 하나 ≈ **63 MB**, dataset 18개, group 3~4개.
 `seg/quality` 는 모드와 무관하게 항상 계산된다.
 리포트 attr 은 `.json` 에 그 필드가 있을 때만 생기므로 record 마다 attr 목록이 다를 수 있다.
 
+### lead 이름 (`--lead-mode`)
+
+원본 `.hea` 의 채널 설명이 전부 `"MARS export"` 라 lead 이름이 없다. `utils.parse_hea` 는
+3채널이면 `["V5","V1","II"]` 를 하드코딩하는데 이는 검증되지 않은 가정이다.
+
+| 모드 | `sig_name` | 채널 배열 | 이후 |
+|---|---|---|---|
+| `file` (기본) | `["ch0","ch1","ch2"]` | 원본 순서 그대로 | 확정되면 `tools/relabel_leads.py` 로 attr 만 변경 |
+| `assumed` | `["II","V1","V5"]` | 가정 이름 기준 재배열 | 가정이 틀리면 재변환 필요 |
+
+관련 root attr: `lead_mode`, `lead_source`(`assumed`/`hea`/`relabeled`),
+`lead_names_assumed`(가정 이름, 원본 채널 순서), relabel 시 `sig_name_prev`.
+
 ### 코호트
 
 `cohort` 는 `--raw` 로 준 디렉토리 아래 첫 디렉토리 이름이다.
