@@ -20,12 +20,17 @@ SSL 은 `splits.csv` 의 **train** 만 쓴다. val 은 손실 추적용. test �
 OUT=/home/coder/workspace/data/holter_v2
 RUN=/home/coder/workspace/data/runs
 
+# record 별 메타 미리 계산 (Stage A 로딩 가속 — 반드시 먼저)
+python -m holter_encoder.prep_meta --splits $OUT/splits.csv --out $OUT/segmeta --workers 32
+
 # Stage A (4 GPU)
-torchrun --nproc_per_node 4 -m holter_encoder.train_stage_a --splits $OUT/splits.csv --out $RUN/stage_a
+torchrun --nproc_per_node 4 -m holter_encoder.train_stage_a --splits $OUT/splits.csv \
+    --out $RUN/stage_a --meta-dir $OUT/segmeta --gpus 0,1,2,3 \
+    --batch 128 --segs-per-record 16 --workers 12
 
 # 토큰 캐시
-torchrun --nproc_per_node 4 -m holter_encoder.cache_tokens \
-    --splits $OUT/splits.csv --stem $RUN/stage_a/stem.pt --out $OUT/tokens_a
+torchrun --nproc_per_node 4 -m holter_encoder.cache_tokens --splits $OUT/splits.csv \
+    --stem $RUN/stage_a/stem.pt --out $OUT/tokens_a --meta-dir $OUT/segmeta --gpus 0,1,2,3
 
 # Stage B — 백본 비교 (같은 토큰 캐시 사용)
 torchrun --nproc_per_node 4 -m holter_encoder.train_stage_b --splits $OUT/splits.csv \
@@ -128,6 +133,13 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe \
   **LongQT 처럼 test 양성 환자가 14명뿐인 태스크는 단일 test 점추정이 크게 흔들리므로 이쪽을 근거로 삼는다**
   (합성 검증: 신호를 심어둔 태스크에서 단일 test 0.41 vs CV 0.741 [0.604-0.844]).
 - `--features stem` 으로 돌리면 Stage A stem 만의 표현과 비교되어 Stage B backbone 의 기여를 분리할 수 있다.
+
+## Stage A 배치 계산
+
+`--batch` 는 **record 수**, 실제 세그먼트 수는 `batch × segs-per-record` 다.
+A6000 에서 GPU 당 2,048 세그먼트(= 128 × 16)가 약 6 GB 수준이다.
+`segs-per-record` 는 파일 여는 비용을 나눠 갚는 장치이고, 너무 키우면 한 배치가
+같은 환자로 치우친다. 8~32 를 권한다.
 
 ## 주의
 

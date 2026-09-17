@@ -32,7 +32,8 @@ def main():
     ap.add_argument("--splits", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--d-model", type=int, default=256)
-    ap.add_argument("--batch", type=int, default=512, help="GPU 당 배치")
+    ap.add_argument("--batch", type=int, default=64,
+                    help="GPU 당 배치(record 수). 실제 세그먼트 수 = batch × segs-per-record")
     ap.add_argument("--steps", type=int, default=30000)
     ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -40,6 +41,12 @@ def main():
     ap.add_argument("--beat-weight", type=float, default=0.3)
     ap.add_argument("--mask-ratio", type=float, default=0.3)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--meta-dir", default=None,
+                    help="prep_meta.py 결과 디렉토리. 있으면 h5 를 열지 않아 훨씬 빠르다")
+    ap.add_argument("--segs-per-record", type=int, default=16,
+                    help="한 번 연 record 에서 뽑는 세그먼트 수 (파일 여는 비용 분할)")
+    ap.add_argument("--clip", type=float, default=20.0, help="정규화 후 진폭 clip (아티팩트 완화)")
+    ap.add_argument("--max-open", type=int, default=256)
     ap.add_argument("--epoch-samples", type=int, default=200_000, help="가상 epoch 크기(GPU 당)")
     ap.add_argument("--val-samples", type=int, default=8192)
     ap.add_argument("--log-every", type=int, default=50)
@@ -61,10 +68,15 @@ def main():
     if main_proc:
         print(f"[stage A] train {len(train_recs):,} record / val {len(val_recs):,}  world={world} device={describe_device(device)}")
 
-    ds = SegmentDataset(train_recs, args.epoch_samples, seed=args.seed, rank=rank)
+    dskw = dict(meta_dir=args.meta_dir, segs_per_item=args.segs_per_record,
+                clip=args.clip, max_open=args.max_open)
+    ds = SegmentDataset(train_recs, args.epoch_samples, seed=args.seed, rank=rank, **dskw)
+    if main_proc and args.meta_dir is None:
+        print("  ** --meta-dir 없이 돌리면 샘플마다 h5 를 열어 매우 느립니다. "
+              "python -m holter_encoder.prep_meta 를 먼저 실행하세요 **")
     dl_kw = dict(batch_size=args.batch, num_workers=args.workers, pin_memory=device.type == "cuda",
                  drop_last=True, persistent_workers=False)
-    val_ds = SegmentDataset(val_recs, args.val_samples, seed=12345, rank=0) if val_recs else None
+    val_ds = SegmentDataset(val_recs, args.val_samples, seed=12345, rank=0, **dskw) if val_recs else None
 
     model = StageAModel(d_model=args.d_model).to(device)
     if world > 1:
@@ -93,9 +105,10 @@ def main():
         for batch in DataLoader(ds, shuffle=False, **dl_kw):
             if step >= args.steps:
                 break
-            x = batch["x"].to(device, non_blocking=True)
-            beat = batch["beat"].to(device, non_blocking=True)
-            bmask = batch["beat_mask"].to(device, non_blocking=True)
+            # (B, K, C, L) → (B*K, C, L)
+            x = batch["x"].flatten(0, 1).to(device, non_blocking=True)
+            beat = batch["beat"].flatten(0, 1).to(device, non_blocking=True)
+            bmask = batch["beat_mask"].flatten(0, 1).to(device, non_blocking=True)
             with autocast(device, use_amp):
                 l_rec, l_beat = model(x, beat, bmask, mask_ratio=args.mask_ratio)
                 loss = l_rec + args.beat_weight * l_beat
@@ -122,7 +135,8 @@ def main():
                 with torch.no_grad():
                     for vb in DataLoader(val_ds, batch_size=args.batch, num_workers=args.workers):
                         with autocast(device, use_amp):
-                            r, b = m(vb["x"].to(device), vb["beat"].to(device), vb["beat_mask"].to(device),
+                            r, b = m(vb["x"].flatten(0, 1).to(device), vb["beat"].flatten(0, 1).to(device),
+                                     vb["beat_mask"].flatten(0, 1).to(device),
                                      mask_ratio=args.mask_ratio, generator=g)
                         tot_r += r.item(); tot_b += b.item(); n += 1
                 m.train()

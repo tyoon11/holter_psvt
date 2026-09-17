@@ -59,6 +59,10 @@ def parse_hhmmss(v):
     return h * 3600 + m * 60 + s
 
 
+def meta_path(meta_dir, record):
+    return os.path.join(meta_dir, record + ".meta.npz")
+
+
 def load_records(splits_csv, split=None, require_eligible=True):
     """splits.csv → [{record, path, pid, cohort, split, hookup_sec, y_*}]"""
     df = pd.read_csv(splits_csv, low_memory=False, dtype={"pid": str})
@@ -84,8 +88,41 @@ def load_records(splits_csv, split=None, require_eligible=True):
 # record 핸들
 # =============================================================================
 class _Rec:
-    def __init__(self, path):
+    """record 하나. prep_meta 로 만든 <record>.meta.npz 가 있으면 h5py 를 열지 않는다.
+
+    메타가 없으면 예전처럼 h5 에서 직접 읽는다 (샘플마다 1MB 이상을 읽어 매우 느리다).
+    """
+
+    def __init__(self, path, meta_dir=None):
         self.path = path
+        self.f = None
+        m = None
+        if meta_dir:
+            mp = meta_path(meta_dir, os.path.splitext(os.path.basename(path))[0])
+            if os.path.exists(mp):
+                try:
+                    m = np.load(mp, allow_pickle=False)
+                except Exception:
+                    m = None
+        if m is not None:
+            self.n_seg, self.seg_len = int(m["n_seg"]), int(m["seg_len"])
+            self.scale = m["scale"].astype(np.float32)
+            self.norm = m["norm"].astype(np.float32)
+            self.valid = m["valid"]
+            self._bt = m["beat_targets"]
+            self.has_beats = bool(m["has_beats"])
+            off = int(m["offset"])
+            if off >= 0:
+                self.sig = np.memmap(path, dtype=str(m["dtype"]), mode="r",
+                                     offset=off, shape=tuple(m["shape"]))
+            else:
+                self.f = h5py.File(path, "r")
+                self.sig = self.f["signal"]
+        else:
+            self._init_from_h5(path)
+        self.valid_idx = np.flatnonzero(self.valid)
+
+    def _init_from_h5(self, path):
         self.f = h5py.File(path, "r")
         a = self.f.attrs
         self.n_seg = int(a["n_seg"])
@@ -95,7 +132,7 @@ class _Rec:
         off = ds.id.get_offset()
         if ds.chunks is None and ds.compression is None and off is not None:
             self.sig = np.memmap(path, dtype=ds.dtype, mode="r", offset=off, shape=ds.shape)
-        else:                                    # memmap 불가 시 h5py 로 읽음 (느림)
+        else:
             self.sig = ds
         q = self.f["seg/quality"][:].astype(np.float32) if "seg/quality" in self.f else None
         if q is not None:
@@ -108,19 +145,25 @@ class _Rec:
             self.valid = np.ones(self.n_seg, bool)
             norm = np.ones(len(self.scale))
         self.norm = np.where(np.isfinite(norm) & (norm > 1e-3), norm, 1.0).astype(np.float32)
-        self.valid_idx = np.flatnonzero(self.valid)
-        self._beats = None
+        self.has_beats = "beat" in self.f
+        self._bt = None
 
-    def segments(self, start, count):
+    def segments(self, start, count, clip=None):
         """(count, C, seg_len) float32, 정규화 완료"""
         a, b = start * self.seg_len, (start + count) * self.seg_len
         x = np.asarray(self.sig[a:b]).astype(np.float32) * self.scale / self.norm   # (T, C)
+        if clip:
+            np.clip(x, -clip, clip, out=x)
         return x.reshape(count, self.seg_len, -1).transpose(0, 2, 1)
 
     def beat_target(self, seg):
-        if "beat" not in self.f:
+        if not self.has_beats:
             return np.zeros(N_BEAT_TARGETS, np.float32), 0.0
-        if self._beats is None:
+        if self._bt is not None:                     # prep_meta 로 미리 계산됨
+            return self._bt[seg].astype(np.float32), 1.0
+        if self.f is None:
+            self.f = h5py.File(self.path, "r")
+        if not hasattr(self, "_beats"):
             self._beats = (self.f["beat/seg_offset"][:], self.f["beat/symbol"][:])
         off, sym = self._beats
         s = sym[off[seg]:off[seg + 1]]
@@ -128,22 +171,24 @@ class _Rec:
         n_sup = sum(int(c in _SUPRA) for c in s)
         n_ven = sum(int(c in _VENT) for c in s)
         n_all = sum(int(c in _BEATS) for c in s)
-        hr = n_all * (60.0 / SEG_SEC)
-        t = np.log1p([n_norm, n_sup, n_ven, n_all]).tolist() + [hr / 100.0]
+        t = np.log1p([n_norm, n_sup, n_ven, n_all]).tolist() + [n_all * (60.0 / SEG_SEC) / 100.0]
         return np.asarray(t, np.float32), 1.0
 
     def close(self):
-        try:
-            self.f.close()
-        except Exception:
-            pass
+        self.sig = None
+        if self.f is not None:
+            try:
+                self.f.close()
+            except Exception:
+                pass
 
 
 class _Handles:
     """워커별 LRU 핸들 캐시. fork 이후 각 워커에서 새로 연다."""
 
-    def __init__(self, max_open=64):
+    def __init__(self, max_open=256, meta_dir=None):
         self.max_open = max_open
+        self.meta_dir = meta_dir
         self.cache = OrderedDict()
         self.pid = None
 
@@ -153,7 +198,7 @@ class _Handles:
             self.pid = os.getpid()
         r = self.cache.get(path)
         if r is None:
-            r = _Rec(path)
+            r = _Rec(path, self.meta_dir)
             self.cache[path] = r
             if len(self.cache) > self.max_open:
                 _, old = self.cache.popitem(last=False)
@@ -170,14 +215,19 @@ class SegmentDataset(Dataset):
     """무작위 (record, 세그먼트) 샘플. 길이는 가상 epoch 크기.
 
     record 는 세그먼트 수에 비례해 뽑는다 (긴 기록이 더 자주 나오도록 = 시간 균등).
+    한 번 고른 record 에서 segs_per_item 개를 뽑아 파일 여는 비용을 나눠 갚는다
+    (서버에서 샘플마다 새 record 를 여느라 551 seg/s 로 GPU 가 굶었다).
     같은 (seed, rank, epoch, index) 면 같은 샘플이 나온다.
     """
 
-    def __init__(self, records, samples_per_epoch=200_000, seed=0, rank=0, max_open=64):
+    def __init__(self, records, samples_per_epoch=200_000, seed=0, rank=0, max_open=256,
+                 meta_dir=None, segs_per_item=1, clip=20.0):
         self.records = records
-        self.n = samples_per_epoch
+        self.segs = max(1, int(segs_per_item))
+        self.n = max(1, samples_per_epoch // self.segs)
         self.seed, self.rank, self.epoch = seed, rank, 0
-        self.h = _Handles(max_open)
+        self.clip = clip
+        self.h = _Handles(max_open, meta_dir)
         w = np.array([max(1.0, r.get("n_seg_hint", 8640)) for r in records], np.float64)
         self.p = w / w.sum()
 
@@ -194,23 +244,27 @@ class SegmentDataset(Dataset):
             r = self.h.get(rec["path"])
             if len(r.valid_idx):
                 break
-        seg = int(rng.choice(r.valid_idx)) if len(r.valid_idx) else 0
-        x = r.segments(seg, 1)[0]
-        bt, bmask = r.beat_target(seg)
-        return {"x": torch.from_numpy(x), "beat": torch.from_numpy(bt),
-                "beat_mask": torch.tensor(bmask, dtype=torch.float32)}
+        if not len(r.valid_idx):
+            segs = np.zeros(self.segs, int)
+        else:
+            segs = rng.choice(r.valid_idx, self.segs, replace=len(r.valid_idx) < self.segs)
+        xs = np.stack([r.segments(int(s), 1, self.clip)[0] for s in segs])
+        bt, bm = zip(*(r.beat_target(int(s)) for s in segs))
+        return {"x": torch.from_numpy(xs),                       # (K, C, L)
+                "beat": torch.from_numpy(np.stack(bt)),          # (K, 5)
+                "beat_mask": torch.tensor(bm, dtype=torch.float32)}
 
 
 # =============================================================================
 # 토큰 캐시 / Stage B
 # =============================================================================
-def iter_segments(path, chunk=512):
+def iter_segments(path, chunk=512, meta_dir=None, clip=None):
     """record 전체를 (start, (n, C, L) 배열, valid(n,)) 청크로 공급."""
-    r = _Rec(path)
+    r = _Rec(path, meta_dir)
     try:
         for s in range(0, r.n_seg, chunk):
             n = min(chunk, r.n_seg - s)
-            yield s, r.segments(s, n), r.valid[s:s + n]
+            yield s, r.segments(s, n, clip), r.valid[s:s + n]
     finally:
         r.close()
 

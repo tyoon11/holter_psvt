@@ -30,6 +30,8 @@ def main():
     ap.add_argument("--stem", required=True, help="train_stage_a 의 stem.pt")
     ap.add_argument("--out", required=True)
     ap.add_argument("--chunk", type=int, default=1024, help="한 번에 stem 에 넣는 세그먼트 수")
+    ap.add_argument("--meta-dir", default=None, help="prep_meta.py 결과 디렉토리")
+    ap.add_argument("--clip", type=float, default=20.0)
     ap.add_argument("--gpus", default=None,
                     help='쓸 GPU 번호, 예: "0,2". torchrun 이면 rank 마다 하나씩 배정')
     ap.add_argument("--no-amp", action="store_true")
@@ -51,7 +53,7 @@ def main():
     for i, r in enumerate(todo):
         toks, valids = [], []
         with torch.no_grad():
-            for _, x, v in iter_segments(r["path"], args.chunk):
+            for _, x, v in iter_segments(r["path"], args.chunk, args.meta_dir, args.clip):
                 with autocast(device, not args.no_amp):
                     tok, _ = stem(torch.from_numpy(x).to(device, non_blocking=True))
                 toks.append(tok.float().cpu().numpy().astype(np.float16))
