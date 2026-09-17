@@ -105,6 +105,29 @@ def scan_record(path):
     return row
 
 
+LABEL_RE = re.compile(r"label|group|^is_|^dx_|outcome|psvt|avnrt|avrt|afib|^afl$|^aa$|^at$|^va", re.I)
+
+
+def _find_near(basename, roots, max_depth=3):
+    """경로가 틀렸을 때 근처(상위 2단계 + 하위 3단계)에서 같은 이름의 파일을 찾는다."""
+    seen = set()
+    for r in roots:
+        if not r:
+            continue
+        a = os.path.abspath(r)
+        for base in (a, os.path.dirname(a), os.path.dirname(os.path.dirname(a))):
+            if base in seen or not os.path.isdir(base):
+                continue
+            seen.add(base)
+            d0 = base.rstrip(os.sep).count(os.sep)
+            for dp, dirs, names in os.walk(base):
+                if dp.count(os.sep) - d0 >= max_depth:
+                    dirs[:] = []
+                if basename in names:
+                    return os.path.join(dp, basename)
+    return None
+
+
 def autodetect_id(df_clin, keys_by_kind, min_rate=0.05):
     """임상 CSV 에서 record 와 가장 잘 매칭되는 (컬럼, 매칭대상) 조합을 찾는다."""
     best = None
@@ -126,6 +149,8 @@ def main():
     ap.add_argument("--clinical", nargs="*", default=[],
                     help="name=path 형식. 예: psvt=/.../clinical_data_psvt.csv")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--consistency", type=float, default=0.9,
+                    help="라벨이 아닌 열을 환자 단위로 붙이는 기준: 여러 행 ID 중 값이 일정한 비율")
     ap.add_argument("--duplicates", default=None,
                     help="find_duplicates.py 결과 CSV. dup_group / dup_keep 컬럼을 붙인다")
     args = ap.parse_args()
@@ -169,29 +194,99 @@ def main():
         if "=" not in spec:
             print(f"  [skip] --clinical 형식 오류: {spec}")
             continue
-        name, path = spec.split("=", 1)
+        name, rest = spec.split("=", 1)
+        # name=path  또는  name=path:컬럼:대상(record_name|file_stem|pid)
+        forced = None
+        parts = rest.rsplit(":", 2)
+        if len(parts) == 3 and parts[2] in keys_by_kind:
+            path, forced = parts[0], (parts[1], parts[2])
+        else:
+            path = rest
         if not os.path.exists(path):
-            print(f"  [skip] 없는 파일: {path}")
-            continue
+            alt = _find_near(os.path.basename(path), [os.path.dirname(path), os.getcwd()] + list(args.src))
+            if alt:
+                print(f"  [{name}] {path} 없음 → {alt} 사용")
+                path = alt
+            else:
+                print(f"  [skip] 없는 파일: {path}")
+                continue
         clin = pd.read_csv(path, dtype=str, keep_default_na=False)
-        hit = autodetect_id(clin, keys_by_kind)
+        clin.columns = [c.lstrip("\ufeff") for c in clin.columns]      # BOM 제거
         print(f"\n[clinical:{name}] {os.path.basename(path)}  "
               f"{len(clin):,}행 × {len(clin.columns)}열")
-        print(f"  컬럼: {list(clin.columns)[:15]}")
+        if forced:
+            if forced[0] not in clin.columns or forced[1] not in keys_by_kind:
+                print(f"  ** 지정한 조인 '{forced[0]}:{forced[1]}' 이 잘못됨. "
+                      f"컬럼 {list(clin.columns)[:12]} / 대상 {list(keys_by_kind)} **")
+                continue
+            vals = clin[forced[0]].astype(str).str.strip()
+            hit = (forced[0], forced[1], vals.isin(keys_by_kind[forced[1]]).mean())
+        else:
+            hit = autodetect_id(clin, keys_by_kind)
         if hit is None:
-            print("  ** ID 컬럼 자동 탐지 실패 — 수동 확인 필요 **")
+            print("  ** ID 컬럼 자동 탐지 실패 — name=path:컬럼:대상 으로 지정하세요 "
+                  f"(대상: {', '.join(keys_by_kind)}) **")
             continue
         col, kind, rate = hit
-        print(f"  ID 컬럼 '{col}' ↔ manifest '{kind}'  매칭률 {rate:.1%} "
-              f"({int(rate*len(clin)):,}/{len(clin):,})")
-        clin = clin.drop_duplicates(subset=[col])
-        clin = clin.rename(columns={c: (c if c == col else f"{name}_{c}")
-                                    for c in clin.columns})
+        clin[col] = clin[col].astype(str).str.strip()
+        n_ids = clin[col].nunique()
+        print(f"  조인 키 '{col}' ↔ manifest '{kind}'  CSV 값 중 일치 {rate:.1%}  "
+              f"(행 {len(clin):,} / 고유 ID {n_ids:,})")
+
+        # 한 ID 에 행이 여러 개면(예: PID 당 record 여러 개) 첫 행만 남기면 record 별 값이
+        # 엉뚱한 record 에 붙는다. ID 안에서 값이 일정한 열만 붙이고, 달라지는 열은 뺀다.
+        # 한 ID 에 행이 여러 개면(예: PID 당 record 여러 개) 첫 행만 남기면 record 별 값이
+        # 엉뚱한 record 에 붙는다. 열마다 판단한다.
+        #   라벨로 보이는 열      : 항상 붙이고, ID 안에서 엇갈리는 ID 만 비운다
+        #   그 밖의 열            : 여러 행 ID 의 대부분(--consistency)에서 일정하면 환자 단위로
+        #                           보고 붙인다(엇갈린 ID 는 비움). 아니면 record 단위 값이라 뺀다.
+        if n_ids < len(clin):
+            others = [c for c in clin.columns if c != col]
+            valid = clin[clin[col] != ""]
+            g = valid.groupby(col)
+            multi = int((g.size() > 1).sum())
+            dropped, blanked, label_conf = [], {}, {}
+            keep_cols = [col]
+            for c in others:
+                nun = g[c].agg(lambda x: x[x != ""].nunique())
+                conflict = set(nun[nun > 1].index)
+                is_label = bool(LABEL_RE.search(c))
+                if is_label or len(conflict) <= (1 - args.consistency) * max(multi, 1):
+                    keep_cols.append(c)
+                    if conflict:
+                        blanked[c] = conflict
+                        if is_label:
+                            label_conf[c] = len(conflict)
+                else:
+                    dropped.append((c, len(conflict)))
+            print(f"  한 ID 에 행 여러 개: {multi:,}개 ID")
+            if dropped:
+                print(f"  record 마다 값이 달라 뺀 열 {len(dropped)}개 (record 단위 값은 h5 리포트 attr 참고):")
+                print("    " + ", ".join(f"{c}({n}/{multi})" for c, n in dropped[:20])
+                      + (" …" if len(dropped) > 20 else ""))
+            if label_conf:
+                print(f"  ** 경고: 같은 ID 안에서 라벨이 엇갈려 그 ID 만 비웠습니다: "
+                      + ", ".join(f"{c} {n}개 ID" for c, n in label_conf.items()) + " **")
+            other_blank = {c: v for c, v in blanked.items() if c not in label_conf}
+            if other_blank:
+                print("  일부 ID 에서만 엇갈려 그 ID 만 비운 열: "
+                      + ", ".join(f"{c}({len(v)})" for c, v in other_blank.items()))
+            agg = valid[keep_cols].groupby(col, as_index=False).agg(
+                lambda x: next((v for v in x if v != ""), ""))
+            for c, ids in blanked.items():
+                agg.loc[agg[col].isin(ids), c] = ""
+            clin = agg
+        clin = clin.rename(columns={c: (c if c == col else f"{name}_{c}") for c in clin.columns})
         before = len(df)
+        df[kind] = df[kind].astype(str)
         df = df.merge(clin, how="left", left_on=kind, right_on=col)
-        df = df.drop(columns=[col]) if col not in (kind,) else df
-        assert len(df) == before, "조인으로 행이 늘었습니다 (중복 ID 확인 필요)"
-        matched = df[[c for c in df.columns if c.startswith(f"{name}_")]].notna().any(axis=1).sum()
+        if col != kind:
+            df = df.drop(columns=[col])
+        assert len(df) == before, "조인으로 행이 늘었습니다"
+        added = [c for c in df.columns if c.startswith(f"{name}_")]
+        matched = int(df[added].notna().any(axis=1).sum()) if added else 0
+        print(f"  붙인 열 {len(added)}개: {', '.join(a[len(name)+1:] for a in added[:12])}"
+              + (" …" if len(added) > 12 else ""))
         print(f"  manifest 측 매칭: {matched:,}/{len(df):,} record")
 
     # ---- 신호 중복 표시 ----
