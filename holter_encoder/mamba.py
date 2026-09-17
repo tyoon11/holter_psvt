@@ -28,12 +28,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# mamba_ssm 은 버전에 따라 Mamba(v1) 의 위치가 달라진다. 하나만 보고 조용히 느린 참조
+# 구현으로 떨어지지 않도록 후보 경로를 모두 시도하고, 무엇을 썼는지 남긴다.
+_FastMamba, MAMBA_SSM_SOURCE = None, None
+for _mod, _name in (("mamba_ssm", "Mamba"),
+                    ("mamba_ssm.modules.mamba_simple", "Mamba"),
+                    ("mamba_ssm.modules.mamba2", "Mamba2")):
+    try:
+        _FastMamba = getattr(__import__(_mod, fromlist=[_name]), _name)
+        MAMBA_SSM_SOURCE = f"{_mod}.{_name}"
+        break
+    except Exception:                                  # ImportError, CUDA 커널 로드 실패 등
+        continue
+HAS_MAMBA_SSM = _FastMamba is not None
+MAMBA_SSM_VERSION = None
 try:
-    from mamba_ssm import Mamba as _FastMamba          # noqa: F401
-    HAS_MAMBA_SSM = True
-except Exception:                                      # ImportError, CUDA 커널 로드 실패 등
-    _FastMamba = None
-    HAS_MAMBA_SSM = False
+    import mamba_ssm as _ms
+    MAMBA_SSM_VERSION = getattr(_ms, "__version__", "?")
+except Exception:
+    pass
 
 _warned = False
 
@@ -91,8 +104,9 @@ def make_mamba(d_model, d_state=16, d_conv=4, expand=2, prefer_fast=True):
     if prefer_fast and HAS_MAMBA_SSM and torch.cuda.is_available():
         return _FastMamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
     if not _warned and torch.cuda.is_available():
-        warnings.warn("mamba_ssm 을 쓸 수 없어 순수 PyTorch 참조 Mamba 를 사용합니다. "
-                      "L=8640 학습은 매우 느립니다: pip install causal-conv1d mamba-ssm --no-build-isolation")
+        why = ("mamba_ssm import 실패" if not HAS_MAMBA_SSM else "prefer_fast=False")
+        warnings.warn(f"순수 PyTorch 참조 Mamba 를 사용합니다 ({why}). L=8640 학습은 매우 느립니다. "
+                      "설치 확인: python -m holter_encoder.check_mamba")
         _warned = True
     return MambaRef(d_model, d_state, d_conv, expand)
 

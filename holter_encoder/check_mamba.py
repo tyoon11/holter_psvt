@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from .mamba import HAS_MAMBA_SSM, MambaRef
+from .mamba import HAS_MAMBA_SSM, MAMBA_SSM_SOURCE, MAMBA_SSM_VERSION, MambaRef, make_mamba
 
 
 def main():
@@ -28,12 +28,14 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA 없음 — GPU 서버에서 실행하세요."); return
     if not HAS_MAMBA_SSM:
-        print("mamba_ssm import 실패.\n  pip install causal-conv1d mamba-ssm --no-build-isolation\n"
-              "  (torch 와 CUDA 버전에 맞는 wheel 이 필요합니다. 실패 시 로그를 확인)"); return
-    from mamba_ssm import Mamba
+        print("mamba_ssm import 실패. 설치 방법은 holter_encoder/README.md 참고.\n"
+              "  사내 프록시면 CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE 로 직접 컴파일"); return
+    print(f"[import] {MAMBA_SSM_SOURCE}  (mamba_ssm {MAMBA_SSM_VERSION}, torch {torch.__version__})")
     dev = torch.device("cuda")
     torch.manual_seed(0)
-    fast = Mamba(d_model=256, d_state=16, d_conv=4, expand=2).to(dev).float()
+    fast = make_mamba(256, 16, 4, 2).to(dev).float()
+    if isinstance(fast, MambaRef):
+        print("  ** 빠른 커널을 못 잡았습니다 (참조 구현 반환) **"); return
     ref = MambaRef(256, 16, 4, 2).to(dev).float()
     fn = {k: tuple(v.shape) for k, v in fast.state_dict().items()}
     rn = {k: tuple(v.shape) for k, v in ref.state_dict().items()}
@@ -42,6 +44,8 @@ def main():
         print("  mamba_ssm 에만:", sorted(set(fn) - set(rn)))
         print("  참조에만     :", sorted(set(rn) - set(fn)))
         print("  모양 다름    :", [k for k in fn if k in rn and fn[k] != rn[k]])
+        print("  → 이름이 다르면 CPU 참조 구현과 체크포인트를 주고받을 수 없습니다. "
+              "GPU 에서만 쓰면 학습에는 지장 없습니다.")
         return
     ref.load_state_dict(fast.state_dict())
     x = torch.randn(2, 512, 256, device=dev)
