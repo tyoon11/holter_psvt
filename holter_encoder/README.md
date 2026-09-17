@@ -102,6 +102,33 @@ enc = HolterEncoder(d_model=c["d_model"], d_state=c["d_state"], depths=tuple(c["
 enc.load_state_dict(ck["state_dict"], strict=False)   # attention pool 은 사전학습되지 않음
 ```
 
+## downstream 평가
+
+```bash
+# 1) 인코더 고정 → record 임베딩
+python -m holter_encoder.embed --splits $OUT/splits.csv --tokens $OUT/tokens_a \
+    --encoder $RUN/stage_b_mamba/encoder.pt --out $RUN/stage_b_mamba/emb.npz --gpus 0
+
+# 2) 선형 probe (백본 여러 개를 한 번에 비교 가능)
+python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe \
+    --emb $RUN/stage_b_s4/emb.npz $RUN/stage_b_mamba/emb.npz --cv
+```
+
+세 가지 특징을 나란히 본다.
+
+| 특징 | 뜻 |
+|---|---|
+| `demo` | 나이 + 평균HR + 성별. **교란 기준선** — 인코더는 이걸 넘어야 의미가 있다 |
+| `enc` | 인코더 임베딩 |
+| `enc+demo` | 둘 다. `demo` 대비 상승폭이 인코더의 순수 기여분 |
+
+- record 는 한 환자 안에서 상관되므로 **환자 단위**로도 집계하고, 신뢰구간은 **환자 부트스트랩**으로 낸다.
+- `--fractions` 로 train 라벨의 10%/25%/100% 결과를 함께 낸다. SSL 의 이점은 라벨이 적을 때 드러난다.
+- `--cv` 는 SSL 이 보지 않은 val+test 환자만 모아 환자 단위 5-fold 로 평가한다.
+  **LongQT 처럼 test 양성 환자가 14명뿐인 태스크는 단일 test 점추정이 크게 흔들리므로 이쪽을 근거로 삼는다**
+  (합성 검증: 신호를 심어둔 태스크에서 단일 test 0.41 vs CV 0.741 [0.604-0.844]).
+- `--features stem` 으로 돌리면 Stage A stem 만의 표현과 비교되어 Stage B backbone 의 기여를 분리할 수 있다.
+
 ## 주의
 
 - time-of-day 는 `.json` 의 `hookup_time` 기준이다. `.hea` 시각은 MARS 내보내기 시각이라 쓰지 않는다.

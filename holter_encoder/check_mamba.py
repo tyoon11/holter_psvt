@@ -52,13 +52,39 @@ def main():
     with torch.no_grad():
         d = (fast(x) - ref(x)).abs().max().item()
     print(f"[출력] 최대 차이 {d:.2e}  {'OK' if d < 1e-3 else '확인 필요'}")
-    x = torch.randn(4, 8640, 256, device=dev)
-    for name, m in (("mamba_ssm", fast), ("참조", ref)):
+    # 속도·메모리: 학습에서 중요한 것은 backward 와 peak memory 다.
+    # 첫 호출에는 커널 초기화가 섞이므로 워밍업 후 여러 번 잰다.
+    def bench(m, B=4, L=8640, reps=3, backward=True):
+        x = torch.randn(B, L, 256, device=dev, requires_grad=backward)
+        torch.cuda.reset_peak_memory_stats()
+        for _ in range(2):                                  # 워밍업
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                y = m(x)
+            if backward:
+                y.float().pow(2).mean().backward()
+            m.zero_grad(set_to_none=True)
         torch.cuda.synchronize(); t = time.time()
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            m(x)
+        for _ in range(reps):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                y = m(x)
+            if backward:
+                y.float().pow(2).mean().backward()
+            m.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
-        print(f"[속도] {name:<9s} B=4 L=8640 forward {time.time() - t:.2f}s")
+        return (time.time() - t) / reps, torch.cuda.max_memory_allocated() / 2**30
+
+    print("[속도·메모리] B=4, L=8640 (24h), d_model=256, bf16")
+    for name, m, bw in (("mamba_ssm fwd", fast, False), ("참조     fwd", ref, False),
+                        ("mamba_ssm fwd+bwd", fast, True), ("참조     fwd+bwd", ref, True)):
+        try:
+            sec, mem = bench(m, backward=bw)
+            print(f"  {name:<20s} {sec*1000:8.0f} ms   peak {mem:5.1f} GiB")
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"  {name:<20s}   OOM — 이 구성으로는 학습 불가")
+    print("\n참조 구현은 (B, L, d_inner, d_state) 중간 텐서를 통째로 들고 있어 backward 에서 메모리가 커진다.\n"
+          "위 fwd+bwd 수치를 보고 --block mamba (전 해상도) 를 쓸지, --mid-block mamba (10분 해상도만) 로\n"
+          "갈지 정한다. 층이 여러 개 쌓이면 실제 학습 메모리는 이보다 더 든다.")
 
 
 if __name__ == "__main__":
