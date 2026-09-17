@@ -504,5 +504,8 @@ def create_h5_structure_v2(
         similarity=_stack(beat_sims, ["bs_corr", "bs_dtw"]),
         hea_meta=hea,
         report=flatten_report(annotation_data) if annotation_data else None,
-        extra_attrs=extra_attrs,
+        # v1 은 metadata/sig_len 에 .hea 의 원래 샘플 수를 남겼다. v2 의 n_samples 는
+        # 10초 단위로 자른 뒤 길이라(마지막 10초 미만은 버린다) 원래 값을 따로 보존한다.
+        extra_attrs={**({"sig_len": int((metadata or {}).get("sig_len") or 0)}),
+                     **(extra_attrs or {})},
     )

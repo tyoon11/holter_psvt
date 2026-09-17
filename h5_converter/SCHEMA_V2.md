@@ -90,6 +90,7 @@ object header 파싱, 개당 수십~수백 µs)가 8,640번 곱해지는 것이 
 │  created_at, created_by
 │  ── 신호 ──
 │  fs=125.0, n_sig=3, n_samples, n_seg, seg_len=1250, duration_h, dtype="int16"
+│  sig_len                                                         ← .hea 원래 샘플 수 (n_samples 는 10초 단위로 자른 길이)
 │  sig_name='["II","V1","V5"]'   scale='[s_II, s_V1, s_V5]'        ← JSON 문자열
 │  base_date, base_time                                           ← .hea
 │  ── 환자 ──
