@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from holter_encoder.data import _Rec, load_records  # noqa: E402
+from holter_encoder.data import _Pack, _Rec, load_records, pack_exists  # noqa: E402
 
 
 def timed(fn, n_ops, threads):
@@ -57,11 +57,13 @@ def main():
     print(f"[io_bench] train {len(recs):,} record / 표본 {len(picks)}")
     st = os.statvfs(recs[0]["path"])
     print(f"  경로: {os.path.dirname(recs[0]['path'])}")
-    print(f"  메타: {'사용' if args.meta_dir else '없음 (h5 직접 열기)'}")
+    packed = pack_exists(args.meta_dir)
+    pack = _Pack(args.meta_dir) if packed else None
+    print(f"  메타: {'묶음(pack)' if packed else ('record 별 npz' if args.meta_dir else '없음 (h5 직접 열기)')}")
 
     # 1) 순차
     def seq(i):
-        r = _Rec(picks[i % len(picks)]["path"], args.meta_dir)
+        r = _Rec(picks[i % len(picks)]["path"], args.meta_dir, pack)
         n = r.segments(0, r.n_seg).nbytes
         r.close()
         return n
@@ -81,7 +83,7 @@ def main():
             starts = [rng.random() for _ in range(args.n_reads)]
 
             def one(i):
-                r = _Rec(recs[order[i]]["path"], args.meta_dir)
+                r = _Rec(recs[order[i]]["path"], args.meta_dir, pack)
                 s = int(starts[i] * max(1, r.n_seg - k))
                 x = r.segments(s, min(k, r.n_seg - s))
                 r.close()
@@ -94,6 +96,7 @@ def main():
     print("\n[읽는 법]")
     print("  - 연속 블록이 랜덤보다 크게 빠르면 디스크 랜덤 접근이 병목 → --segs-per-record 를 키운다")
     print("  - threads 를 늘릴 때 seg/s 가 계속 오르면 지연이 병목 → --workers 를 늘린다")
+    print("  - record-open/s 가 스레드와 무관하게 일정하면 여는 비용이 상한이다 → 묶음 메타(pack)")
     print("  - 둘 다 안 오르면 대역폭 한계 → 로컬 NVMe 로 옮기는 것 외에는 방법이 없다")
     print("  - Stage A 목표: (GPU 수 × batch × segs-per-record) / 원하는 스텝 시간 만큼의 seg/s")
 

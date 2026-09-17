@@ -86,14 +86,76 @@ def build_one(args):
         return f"error {type(e).__name__}: {e}"
 
 
+PACK_INDEX = "pack_index.npz"
+PACK_VALID = "pack_valid.npy"
+PACK_BEATS = "pack_beats.npy"
+
+
+def build_pack(meta_dir, records):
+    """record 별 .meta.npz 를 하나로 묶는다.
+
+    io_bench 에서 record-open/s 가 스레드를 늘려도 545~639 에 고정됐다. 디스크가 아니라
+    샘플마다 np.load 로 npz 를 여는 파이썬 비용(zip 파싱)이 상한이었다(GIL 때문에
+    스레드로도 안 풀린다). 묶어두면 워커가 시작할 때 한 번만 memmap 하고, 이후 record
+    열기는 배열 슬라이스라 사실상 공짜다. 페이지 캐시도 워커끼리 공유된다.
+    """
+    names, rows, n_segs = [], [], []
+    keep = []
+    for r in records:
+        mp = meta_path(meta_dir, r["record"])
+        if os.path.exists(mp):
+            keep.append((r["record"], mp))
+    total = 0
+    metas = []
+    for name, mp in keep:
+        m = np.load(mp, allow_pickle=False)
+        n = int(m["n_seg"])
+        metas.append((name, mp, n, total))
+        total += n
+    print(f"  묶는 중: record {len(metas):,}개 / 세그먼트 {total:,}개")
+
+    valid = np.lib.format.open_memmap(os.path.join(meta_dir, PACK_VALID + ".tmp"), mode="w+",
+                                      dtype=bool, shape=(total,))
+    beats = np.lib.format.open_memmap(os.path.join(meta_dir, PACK_BEATS + ".tmp"), mode="w+",
+                                      dtype=np.float16, shape=(total, N_BEAT_TARGETS))
+    idx = {k: [] for k in ("record", "row", "n_seg", "seg_len", "offset", "n_samples",
+                           "n_sig", "dtype", "has_beats")}
+    scales, norms = [], []
+    for name, mp, n, row in metas:
+        m = np.load(mp, allow_pickle=False)
+        valid[row:row + n] = m["valid"]
+        beats[row:row + n] = m["beat_targets"]
+        shape = m["shape"]
+        idx["record"].append(name); idx["row"].append(row); idx["n_seg"].append(n)
+        idx["seg_len"].append(int(m["seg_len"])); idx["offset"].append(int(m["offset"]))
+        idx["n_samples"].append(int(shape[0])); idx["n_sig"].append(int(shape[1]))
+        idx["dtype"].append(str(m["dtype"])); idx["has_beats"].append(bool(m["has_beats"]))
+        scales.append(m["scale"]); norms.append(m["norm"])
+    valid.flush(); beats.flush()
+    del valid, beats
+    os.replace(os.path.join(meta_dir, PACK_VALID + ".tmp"), os.path.join(meta_dir, PACK_VALID))
+    os.replace(os.path.join(meta_dir, PACK_BEATS + ".tmp"), os.path.join(meta_dir, PACK_BEATS))
+    np.savez(os.path.join(meta_dir, PACK_INDEX + ".tmp.npz"),
+             scale=np.stack(scales).astype(np.float32), norm=np.stack(norms).astype(np.float32),
+             **{k: np.array(v) for k, v in idx.items()})
+    os.replace(os.path.join(meta_dir, PACK_INDEX + ".tmp.npz"), os.path.join(meta_dir, PACK_INDEX))
+    mb = (total * 1 + total * N_BEAT_TARGETS * 2) / 1e6
+    print(f"  [saved] {PACK_INDEX} / {PACK_VALID} / {PACK_BEATS}  ({mb:.0f} MB)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--splits", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--no-pack", action="store_true", help="record 별 파일만 만들고 묶지 않음")
+    ap.add_argument("--pack-only", action="store_true", help="이미 만든 메타를 묶기만 함")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     recs = load_records(args.splits, split=None)
+    if args.pack_only:
+        build_pack(args.out, recs)
+        return
     jobs = [(r["path"], args.out) for r in recs]
     print(f"[prep_meta] {len(jobs):,} record → {args.out}")
     t0 = time.time()
@@ -107,6 +169,8 @@ def main():
                 print(f"\r  {i+1:,}/{len(jobs):,}  {el:.0f}s  ETA {(len(jobs)-i-1)*el/(i+1):.0f}s",
                       end="", flush=True)
     print(f"\n[prep_meta] {dict(stats)}")
+    if not args.no_pack:
+        build_pack(args.out, recs)
 
 
 if __name__ == "__main__":

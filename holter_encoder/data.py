@@ -87,16 +87,59 @@ def load_records(splits_csv, split=None, require_eligible=True):
 # =============================================================================
 # record 핸들
 # =============================================================================
+class _Pack:
+    """묶음 메타. 워커마다 한 번만 열고 이후 record 열기는 슬라이스로 끝난다."""
+
+    def __init__(self, meta_dir):
+        i = np.load(os.path.join(meta_dir, "pack_index.npz"), allow_pickle=False)
+        self.row = {str(r): k for k, r in enumerate(i["record"])}
+        self.i = {k: i[k] for k in ("row", "n_seg", "seg_len", "offset", "n_samples",
+                                    "n_sig", "dtype", "has_beats")}
+        self.scale, self.norm = i["scale"], i["norm"]
+        self.valid = np.load(os.path.join(meta_dir, "pack_valid.npy"), mmap_mode="r")
+        self.beats = np.load(os.path.join(meta_dir, "pack_beats.npy"), mmap_mode="r")
+
+    def get(self, record):
+        k = self.row.get(record)
+        if k is None:
+            return None
+        r0, n = int(self.i["row"][k]), int(self.i["n_seg"][k])
+        return {"n_seg": n, "seg_len": int(self.i["seg_len"][k]),
+                "offset": int(self.i["offset"][k]), "dtype": str(self.i["dtype"][k]),
+                "shape": (int(self.i["n_samples"][k]), int(self.i["n_sig"][k])),
+                "scale": self.scale[k], "norm": self.norm[k],
+                "has_beats": bool(self.i["has_beats"][k]),
+                "valid": np.asarray(self.valid[r0:r0 + n]), "beats": self.beats[r0:r0 + n]}
+
+
+def pack_exists(meta_dir):
+    return bool(meta_dir) and os.path.exists(os.path.join(meta_dir, "pack_index.npz"))
+
+
 class _Rec:
     """record 하나. prep_meta 로 만든 <record>.meta.npz 가 있으면 h5py 를 열지 않는다.
 
     메타가 없으면 예전처럼 h5 에서 직접 읽는다 (샘플마다 1MB 이상을 읽어 매우 느리다).
     """
 
-    def __init__(self, path, meta_dir=None):
+    def __init__(self, path, meta_dir=None, pack=None):
         self.path = path
         self.f = None
         m = None
+        if pack is not None:                      # 묶음 메타 (가장 빠름)
+            d = pack.get(os.path.splitext(os.path.basename(path))[0])
+            if d is not None:
+                self.n_seg, self.seg_len = d["n_seg"], d["seg_len"]
+                self.scale, self.norm = d["scale"], d["norm"]
+                self.valid, self._bt, self.has_beats = d["valid"], d["beats"], d["has_beats"]
+                if d["offset"] >= 0:
+                    self.sig = np.memmap(path, dtype=d["dtype"], mode="r",
+                                         offset=d["offset"], shape=d["shape"])
+                else:
+                    self.f = h5py.File(path, "r")
+                    self.sig = self.f["signal"]
+                self.valid_idx = np.flatnonzero(self.valid)
+                return
         if meta_dir:
             mp = meta_path(meta_dir, os.path.splitext(os.path.basename(path))[0])
             if os.path.exists(mp):
@@ -189,6 +232,7 @@ class _Handles:
     def __init__(self, max_open=256, meta_dir=None):
         self.max_open = max_open
         self.meta_dir = meta_dir
+        self.pack = None
         self.cache = OrderedDict()
         self.pid = None
 
@@ -196,9 +240,11 @@ class _Handles:
         if self.pid != os.getpid():            # fork 된 새 프로세스 → 물려받은 핸들 폐기
             self.cache = OrderedDict()
             self.pid = os.getpid()
+        if self.pack is None and pack_exists(self.meta_dir):
+            self.pack = _Pack(self.meta_dir)      # 워커마다 최초 1회
         r = self.cache.get(path)
         if r is None:
-            r = _Rec(path, self.meta_dir)
+            r = _Rec(path, self.meta_dir, self.pack)
             self.cache[path] = r
             if len(self.cache) > self.max_open:
                 _, old = self.cache.popitem(last=False)
@@ -276,7 +322,7 @@ class SegmentDataset(Dataset):
 # =============================================================================
 def iter_segments(path, chunk=512, meta_dir=None, clip=None):
     """record 전체를 (start, (n, C, L) 배열, valid(n,)) 청크로 공급."""
-    r = _Rec(path, meta_dir)
+    r = _Rec(path, meta_dir, _Pack(meta_dir) if pack_exists(meta_dir) else None)
     try:
         for s in range(0, r.n_seg, chunk):
             n = min(chunk, r.n_seg - s)

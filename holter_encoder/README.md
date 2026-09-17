@@ -20,8 +20,10 @@ SSL 은 `splits.csv` 의 **train** 만 쓴다. val 은 손실 추적용. test �
 OUT=/home/coder/workspace/data/holter_v2
 RUN=/home/coder/workspace/data/runs
 
-# record 별 메타 미리 계산 (Stage A 로딩 가속 — 반드시 먼저)
+# record 별 메타 미리 계산 + 하나로 묶기 (Stage A 로딩 가속 — 반드시 먼저)
 python -m holter_encoder.prep_meta --splits $OUT/splits.csv --out $OUT/segmeta --workers 32
+# 이미 record 별 메타가 있으면 묶기만:
+# python -m holter_encoder.prep_meta --splits $OUT/splits.csv --out $OUT/segmeta --pack-only
 
 # Stage A (4 GPU)
 torchrun --nproc_per_node 4 -m holter_encoder.train_stage_a --splits $OUT/splits.csv \
@@ -144,6 +146,7 @@ python tools/io_bench.py --splits $OUT/splits.csv --meta-dir $OUT/segmeta --thre
 
 | 관찰 | 조치 |
 |---|---|
+| `record-open/s` 가 스레드와 무관하게 일정 | 파일 여는 비용이 상한 → 묶음 메타(`--pack-only`) |
 | 연속 블록 ≫ 랜덤 | 랜덤 접근이 병목 → `--segs-per-record` 를 키운다 (16 → 32/64) |
 | threads 를 늘릴수록 seg/s 상승 | 지연이 병목 → `--workers` 를 늘린다 |
 | 둘 다 정체 | 대역폭 한계 → 로컬 NVMe 로 옮기거나, GPU 수를 줄이고 남은 GPU 를 양보한다 |
