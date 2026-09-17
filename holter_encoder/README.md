@@ -138,6 +138,9 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe \
 
 ## Stage A 가 느릴 때 (GPU util 이 낮을 때)
 
+> 지금까지 찾은 병목 네 가지와 진단 방법은 [docs/PERFORMANCE.md](../docs/PERFORMANCE.md) 참고.
+
+
 Stage A 는 IO 에 묶이기 쉽다. 저장소 특성을 먼저 잰다.
 
 ```bash
