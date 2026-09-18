@@ -19,6 +19,7 @@ probe.py — 고정된 인코더 임베딩으로 downstream 선형 probe 평가.
 
 import argparse
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,9 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+
+# sklearn 의 deprecation 안내가 fold 마다 쏟아져 표를 덮는다. 결과에는 영향이 없다.
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 
 TASKS = [("LongQT", "y_lqt"), ("TOF", "y_tof"), ("PSVT", "y_psvt")]
 CS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0]
@@ -102,7 +106,10 @@ def main():
     ap.add_argument("--emb", required=True, nargs="+", help="embed.py 결과 npz (여러 개면 비교)")
     ap.add_argument("--splits", required=True, help="나이/HR/성별 등 메타")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--features", default="mean", choices=["mean", "mean+std", "stem"])
+    ap.add_argument("--features", nargs="+", default=["mean"],
+                    choices=["mean", "mean+std", "stem"],
+                    help="여러 개를 주면 한 번에 비교한다. stem 은 Stage A 만의 표현이라 "
+                         "Stage B backbone 의 기여를 분리해서 볼 수 있다")
     ap.add_argument("--fractions", type=float, nargs="*", default=[0.1, 0.25, 1.0])
     ap.add_argument("--boot", type=int, default=1000)
     ap.add_argument("--cv", action="store_true",
@@ -138,8 +145,8 @@ def main():
     for path in args.emb:
         z = np.load(path, allow_pickle=True)
         rec = z["record"].astype(str)
-        X = {"mean": z["X_mean"], "mean+std": np.concatenate([z["X_mean"], z["X_std"]], 1),
-             "stem": z["X_stem"]}[args.features]
+        Xs = {"mean": z["X_mean"], "mean+std": np.concatenate([z["X_mean"], z["X_std"]], 1),
+              "stem": z["X_stem"]}
         split = z["split"].astype(str)
         pid = z["pid"].astype(str)
         m = meta.reindex(rec)
@@ -149,7 +156,7 @@ def main():
             return np.where(np.isfinite(A), A, med)
 
         D = fill(np.stack([m["age_num"].values, m["hr"].values, m["male"].values], 1))
-        feats = {"demo": D, "enc": X, "enc+demo": np.concatenate([X, D], 1)}
+        feats = {"demo": D}          # enc / enc+demo 는 특징 종류마다 아래에서 채운다
         if meta_cols and not args.no_meta:
             M = fill(m[meta_cols].to_numpy(dtype=float))
             feats["meta"] = np.concatenate([M, D], 1)      # 촬영 조건 + 인구학
@@ -160,8 +167,36 @@ def main():
             keep_all = np.isfinite(a) & (a >= lo) & (a <= hi)
             print(f"  나이 {lo:g}~{hi:g}세로 제한: {int(keep_all.sum()):,}/{len(rec):,} record")
         name = path.split("/")[-2] if "/" in path else path
-        print(f"\n{'='*78}\n[{name}]  {args.features}  X {X.shape}\n{'='*78}")
+        for feat_name in args.features:
+            X = Xs[feat_name]
+            feats = {k: v for k, v in feats.items() if not k.startswith("enc")}
+            feats["enc"] = X
+            feats["enc+demo"] = np.concatenate([X, D], 1)
+            print(f"\n{'='*78}\n[{name}]  특징={feat_name}  X {X.shape}\n{'='*78}")
+            run_tasks(name, feat_name, X, D, feats, z, split, pid, keep_all, args, rows)
 
+    df = pd.DataFrame(rows).drop(columns=["pat_ci"])
+    df.to_csv(args.out + ".csv", index=False)
+    print(f"\n[saved] {args.out}.csv")
+    print(HOWTO)
+
+
+HOWTO = """
+[읽는 법]
+  - enc 가 demo 를 못 넘으면 인코더가 질환 정보를 못 담은 것이다 (특히 TOF)
+  - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다
+  - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는
+    질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험
+  - --age-band 로 나이를 맞춘 뒤에도 남는 성능이 나이 교란을 뺀 실력이다
+  - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다
+  - 특징 stem(Stage A 만) 대비 mean(Stage B 통과)이 나아지지 않으면 backbone 이
+    기여하지 못한 것이다. stem 은 세 백본에서 같은 값이라 한 번만 보면 된다
+  - CV 행은 SSL 이 보지 않은 val+test 환자만으로 돌린 교차검증이다. 양성이 적은
+    태스크(LongQT)는 단일 test 점추정보다 이쪽을 근거로 삼는다
+"""
+
+
+def run_tasks(name, feat_name, X, D, feats, z, split, pid, keep_all, args, rows):
         for task, col in TASKS:
             y = z[col].astype(float)
             ok = np.isfinite(y) & keep_all
@@ -181,7 +216,7 @@ def main():
                     lo, hi = r["pat_ci"]
                     print(f"    {fname:<9s}{frac:>6.0%}{r['val_auroc']:>7.3f}{r['rec_auroc']:>12.3f}"
                           f"{r['pat_auroc']:>13.3f}{f'[{lo:.3f}-{hi:.3f}]':>18s}{r['pat_auprc']:>12.3f}")
-                    rows.append({"emb": name, "features": args.features, "task": task,
+                    rows.append({"emb": name, "features": feat_name, "task": task,
                                  "feature_set": fname, "train_frac": frac, **r,
                                  "pat_ci_lo": lo, "pat_ci_hi": hi})
             if args.cv:
@@ -193,27 +228,12 @@ def main():
                     lo, hi = r["pat_ci"]
                     print(f"    {fname:<9s}{'CV':>6s}{'-':>7s}{r['rec_auroc']:>12.3f}"
                           f"{r['pat_auroc']:>13.3f}{f'[{lo:.3f}-{hi:.3f}]':>18s}{r['pat_auprc']:>12.3f}")
-                    rows.append({"emb": name, "features": args.features, "task": task,
+                    rows.append({"emb": name, "features": feat_name, "task": task,
                                  "feature_set": fname, "train_frac": "cv", **r,
                                  "pat_ci_lo": lo, "pat_ci_hi": hi})
             npos = rows[-1]["n_test_pos_pat"] if rows else 0
             if npos < 30:
                 print(f"    ** test 양성 환자 {npos}명 — CI 가 넓으니 점추정만으로 비교하지 말 것 **")
-
-    df = pd.DataFrame(rows).drop(columns=["pat_ci"])
-    df.to_csv(args.out + ".csv", index=False)
-    print(f"\n[saved] {args.out}.csv")
-    print("\n[읽는 법]")
-    print("  - enc 가 demo 를 못 넘으면 인코더가 질환 정보를 못 담은 것이다 (특히 TOF)")
-    print("  - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는")
-    print("    질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험")
-    print("  - --age-band 로 나이를 맞춘 뒤에도 남는 성능이 나이 교란을 뺀 실력이다")
-    print("  - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다")
-    print("  - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다")
-    print("  - stem 특징(--features stem)과 비교하면 Stage B backbone 의 기여를 분리할 수 있다")
-    print("  - CV 행은 SSL 이 보지 않은 val+test 환자만으로 돌린 교차검증이다. 양성이 적은")
-    print("    태스크(LongQT)는 단일 test 점추정보다 이쪽을 근거로 삼는다")
-
 
 if __name__ == "__main__":
     main()
