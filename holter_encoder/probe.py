@@ -109,6 +109,10 @@ def main():
                     help="val+test 환자를 모아 환자 단위 5-fold 교차검증도 수행 "
                          "(LongQT 처럼 양성이 적을 때 권장)")
     ap.add_argument("--cv-folds", type=int, default=5)
+    ap.add_argument("--no-meta", action="store_true",
+                    help="촬영 조건(meta) 기준선을 계산하지 않는다")
+    ap.add_argument("--age-band", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="이 나이 구간의 record 만 사용 (코호트 간 나이 차이 교란 확인용)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -116,7 +120,19 @@ def main():
     meta["age_num"] = pd.to_numeric(meta.get("age"), errors="coerce").where(lambda s: s >= 0)
     meta["hr"] = pd.to_numeric(meta.get("mean_hr_bpm"), errors="coerce")
     meta["male"] = meta.get("gender", pd.Series(index=meta.index, dtype=str)).astype(str).str.lower().str[:1].map({"m": 1.0, "f": 0.0})
+    # 촬영 조건만으로 만든 특징. LongQT/TOF 는 라벨이 "어느 코호트 폴더인가" 이므로,
+    # 장비·시기·전처리 차이(배치 효과)만으로도 높은 점수가 나올 수 있다. 이 특징이
+    # 인코더와 비슷한 점수를 내면 그 태스크의 성능은 질환 정보의 근거가 되지 못한다.
+    hh = meta.get("hookup_time", pd.Series(index=meta.index, dtype=str)).astype(str).str[:2]
+    meta["hour"] = pd.to_numeric(hh, errors="coerce")
+    META_COLS = ["duration_h", "n_seg", "n_beats", "hr", "nan_ratio_mean", "amp_std_mean",
+                 "flat_seg_ratio", "ann_len", "file_bytes", "hour",
+                 "scale_II", "scale_V1", "scale_V5"]
+    for c in META_COLS:
+        if c in meta:
+            meta[c] = pd.to_numeric(meta[c], errors="coerce")
     meta = meta.set_index("record_name")
+    meta_cols = [c for c in META_COLS if c in meta.columns]
 
     rows = []
     for path in args.emb:
@@ -127,20 +143,33 @@ def main():
         split = z["split"].astype(str)
         pid = z["pid"].astype(str)
         m = meta.reindex(rec)
-        D = np.stack([m["age_num"].values, m["hr"].values, m["male"].values], 1)
-        D = np.where(np.isfinite(D), D, np.nanmedian(np.where(np.isfinite(D), D, np.nan), axis=0))
+        def fill(A):
+            med = np.nanmedian(np.where(np.isfinite(A), A, np.nan), axis=0)
+            med = np.where(np.isfinite(med), med, 0.0)
+            return np.where(np.isfinite(A), A, med)
+
+        D = fill(np.stack([m["age_num"].values, m["hr"].values, m["male"].values], 1))
         feats = {"demo": D, "enc": X, "enc+demo": np.concatenate([X, D], 1)}
+        if meta_cols and not args.no_meta:
+            M = fill(m[meta_cols].to_numpy(dtype=float))
+            feats["meta"] = np.concatenate([M, D], 1)      # 촬영 조건 + 인구학
+        keep_all = np.ones(len(rec), bool)
+        if args.age_band:
+            lo, hi = args.age_band
+            a = m["age_num"].values
+            keep_all = np.isfinite(a) & (a >= lo) & (a <= hi)
+            print(f"  나이 {lo:g}~{hi:g}세로 제한: {int(keep_all.sum()):,}/{len(rec):,} record")
         name = path.split("/")[-2] if "/" in path else path
         print(f"\n{'='*78}\n[{name}]  {args.features}  X {X.shape}\n{'='*78}")
 
         for task, col in TASKS:
             y = z[col].astype(float)
-            ok = np.isfinite(y)
+            ok = np.isfinite(y) & keep_all
             print(f"\n  {task}  (라벨 있는 record {int(ok.sum()):,})")
             print(f"    {'특징':<9s}{'비율':>6s}{'val':>7s}{'test AUROC':>12s}{'환자 AUROC':>13s}"
                   f"{'95% CI':>18s}{'환자 AUPRC':>12s}")
             for fname, F in feats.items():
-                for frac in (args.fractions if fname != "demo" else [1.0]):
+                for frac in (args.fractions if fname.startswith("enc") else [1.0]):
                     tr = ok & (split == "train"); va = ok & (split == "val"); te = ok & (split == "test")
                     if frac < 1.0:                       # 환자 단위로 train 일부만
                         rng = np.random.default_rng(args.seed)
@@ -176,6 +205,9 @@ def main():
     print(f"\n[saved] {args.out}.csv")
     print("\n[읽는 법]")
     print("  - enc 가 demo 를 못 넘으면 인코더가 질환 정보를 못 담은 것이다 (특히 TOF)")
+    print("  - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는")
+    print("    질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험")
+    print("  - --age-band 로 나이를 맞춘 뒤에도 남는 성능이 나이 교란을 뺀 실력이다")
     print("  - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다")
     print("  - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다")
     print("  - stem 특징(--features stem)과 비교하면 Stage B backbone 의 기여를 분리할 수 있다")
