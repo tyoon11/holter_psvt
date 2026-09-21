@@ -345,6 +345,54 @@ def iter_segments(path, chunk=512, meta_dir=None, clip=None):
         r.close()
 
 
+class RawWindowDataset(Dataset):
+    """원신호에서 연속 구간(기본 2시간)을 잘라 온다. stem 까지 미세조정할 때 쓴다.
+
+    24시간 전체를 gradient 와 함께 통과시키면 메모리가 크다. 학습 때는 무작위 구간을
+    쓰고(증강 효과도 있다), 평가 때는 전체를 gradient 없이 통과시킨다.
+    반환은 int16 원값 + 채널별 gain (GPU 에서 변환).
+    """
+
+    def __init__(self, records, meta_dir, crop_seg=720, random_crop=True, seed=0,
+                 max_open=128, clip=20.0):
+        self.records, self.crop, self.random_crop = records, crop_seg, random_crop
+        self.seed, self.epoch, self.clip = seed, 0, clip
+        self.h = _Handles(max_open, meta_dir)
+
+    def set_epoch(self, e):
+        self.epoch = e
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, i):
+        rec = self.records[i]
+        r = self.h.get(rec["path"])
+        L = min(self.crop, r.n_seg)
+        if self.random_crop and r.n_seg > L:
+            rng = np.random.default_rng([self.seed, self.epoch, i])
+            start = int(rng.integers(0, r.n_seg - L + 1))
+        else:
+            start = 0
+        x = r.segments(start, L, self.clip, raw=True)          # (L, C, seg_len) int16
+        pad = np.zeros(self.crop, bool)
+        valid = np.asarray(r.valid[start:start + L])
+        if L < self.crop:                                      # 짧은 record 는 뒤를 패딩
+            x = np.concatenate([x, np.zeros((self.crop - L,) + x.shape[1:], x.dtype)])
+            pad[L:] = True
+            valid = np.concatenate([valid, np.zeros(self.crop - L, bool)])
+        hs = rec.get("hookup_sec", float("nan"))
+        if np.isfinite(hs):
+            tod = ((hs + (start + np.arange(self.crop)) * SEG_SEC) % 86400.0) / 86400.0
+        else:
+            tod = np.full(self.crop, np.nan)
+        return {"x": torch.from_numpy(np.ascontiguousarray(x)),
+                "gain": torch.from_numpy(r.gain),
+                "tod": torch.from_numpy(tod.astype(np.float32)),
+                "pad": torch.from_numpy(pad),
+                "seg_valid": torch.from_numpy(valid & ~pad)}
+
+
 def token_paths(token_dir, record):
     return os.path.join(token_dir, record + ".npy"), os.path.join(token_dir, record + ".valid.npy")
 

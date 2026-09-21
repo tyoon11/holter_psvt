@@ -34,18 +34,30 @@ from torch.utils.data import DataLoader, Dataset
 
 from .common import (CSVLogger, autocast, cosine_with_warmup, describe_device, ensure_kernel_cache,
                      limit_cpu_threads, param_groups, save_checkpoint, setup_distributed, unwrap)
-from .data import TokenDataset, load_records
+from .data import RawWindowDataset, TokenDataset, load_records
 from .embed import build_from_checkpoint
 
 TASK_COL = {"psvt": "y_psvt", "lqt": "y_lqt", "tof": "y_tof"}
 
 
-class LabeledTokens(Dataset):
-    """TokenDataset 에 라벨을 붙인다. 라벨이 없는 record 는 제외."""
+def _labeled(records, col):
+    return [r for r in records
+            if r.get(col) is not None and np.isfinite(float(r[col]))]
 
-    def __init__(self, records, token_dir, col, crop, random_crop, seed=0):
-        keep = [r for r in records if r.get(col) is not None and np.isfinite(float(r[col]))]
-        self.inner = TokenDataset(keep, token_dir, crop=crop, random_crop=random_crop, seed=seed)
+
+class LabeledTokens(Dataset):
+    """토큰(또는 원신호)에 라벨을 붙인다. 라벨이 없는 record 는 제외.
+
+    raw_meta_dir 를 주면 원신호 경로로 동작한다 (stem 까지 미세조정할 때).
+    """
+
+    def __init__(self, records, token_dir, col, crop, random_crop, seed=0, raw_meta_dir=None):
+        keep = _labeled(records, col)
+        if raw_meta_dir:
+            self.inner = RawWindowDataset(keep, raw_meta_dir, crop_seg=crop,
+                                          random_crop=random_crop, seed=seed)
+        else:
+            self.inner = TokenDataset(keep, token_dir, crop=crop, random_crop=random_crop, seed=seed)
         self.y = np.array([float(r[col]) for r in self.inner.records], np.float32)
         self.pid = np.array([r["pid"] for r in self.inner.records])
 
@@ -63,16 +75,24 @@ class LabeledTokens(Dataset):
 
 
 class Classifier(nn.Module):
-    """인코더(토큰 입력) + attention pooling + 선형 분류기."""
+    """인코더 + attention pooling + 선형 분류기. 토큰 또는 원신호를 받는다."""
 
     def __init__(self, enc, dropout=0.2):
         super().__init__()
         self.enc = enc
-        d = enc.d_model
-        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d, 1))
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(enc.d_model, 1))
 
-    def forward(self, tokens, tod, pad):
-        out = self.enc(tokens=tokens, tod=tod, mask=pad)
+    def forward(self, batch, device, clip=20.0, checkpoint=True):
+        tod, pad = batch["tod"].to(device), batch["pad"].to(device)
+        if "tokens" in batch:
+            out = self.enc(tokens=batch["tokens"].to(device), tod=tod, mask=pad)
+        else:
+            x = batch["x"].to(device)                       # (B, S, C, L) int16
+            g = batch["gain"].to(device)
+            x = x.float() * g[:, None, :, None]
+            if clip:
+                x = x.clamp_(-clip, clip)
+            out = self.enc(segments=x, tod=tod, mask=pad, checkpoint=checkpoint)
         return self.head(out["record"]).squeeze(-1)
 
 
@@ -100,7 +120,7 @@ def evaluate(model, ds, device, batch, amp, boot=1000):
     probs = np.zeros(len(ds), np.float32)
     for b in DataLoader(ds, batch_size=batch, num_workers=2):
         with autocast(device, amp):
-            logit = model(b["tokens"].to(device), b["tod"].to(device), b["pad"].to(device))
+            logit = model(b, device, checkpoint=False)
         probs[b["idx"].numpy()] = torch.sigmoid(logit.float()).cpu().numpy()
     model.train()
     return probs, patient_metrics(probs, ds.y, ds.pid, boot)
@@ -115,12 +135,21 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--crop", type=int, default=8640)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--eval-batch", type=int, default=None,
+                    help="평가 배치 (기본: 학습과 동일, 원신호 경로면 1)")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-4, help="head/pooling 학습률")
     ap.add_argument("--backbone-lr", type=float, default=3e-5, help="backbone 은 더 낮게")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--freeze-backbone", action="store_true")
+    ap.add_argument("--unfreeze-stem", action="store_true",
+                    help="원신호로 stem 까지 미세조정한다. --meta-dir 필요, 훨씬 느리다")
+    ap.add_argument("--meta-dir", default=None, help="prep_meta 결과 (원신호 경로에 필요)")
+    ap.add_argument("--stem-lr", type=float, default=1e-5)
+    ap.add_argument("--raw-crop", type=int, default=720,
+                    help="원신호 학습 시 자를 세그먼트 수 (720 = 2시간)")
+    ap.add_argument("--eval-crop", type=int, default=8640, help="평가 시 사용할 세그먼트 수")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--boot", type=int, default=1000)
     ap.add_argument("--gpus", default=None)
@@ -135,20 +164,30 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     col = TASK_COL[args.task]
 
+    if args.unfreeze_stem and not args.meta_dir:
+        raise SystemExit("--unfreeze-stem 에는 --meta-dir (prep_meta 결과)가 필요합니다.")
     enc, cfg = build_from_checkpoint(args.encoder, device)
     model = Classifier(enc, args.dropout).to(device)
-    for p in model.enc.stem.parameters():          # stem 은 항상 고정 (입력이 캐시 토큰)
-        p.requires_grad_(False)
+    if not args.unfreeze_stem:                     # 입력이 캐시 토큰이면 stem 은 쓰이지 않는다
+        for p in model.enc.stem.parameters():
+            p.requires_grad_(False)
     if args.freeze_backbone:
         for p in model.enc.backbone.parameters():
             p.requires_grad_(False)
 
-    ds = {s: LabeledTokens(load_records(args.splits, s), args.tokens, col, args.crop,
-                           random_crop=(s == "train"), seed=args.seed)
+    raw = args.meta_dir if args.unfreeze_stem else None
+    # 평가는 24시간 전체를 통과시킨다. 원신호 경로에서는 한 건만 해도 8,640 세그먼트다.
+    eval_batch = args.eval_batch or (1 if raw else args.batch)
+    ds = {s: LabeledTokens(load_records(args.splits, s), args.tokens, col,
+                           crop=(args.raw_crop if (raw and s == "train") else
+                                 args.eval_crop if raw else args.crop),
+                           random_crop=(s == "train"), seed=args.seed, raw_meta_dir=raw)
           for s in ("train", "val", "test")}
     n_pos = int(ds["train"].y.sum())
     print(f"[finetune] {args.task}  {describe_device(device)}  block={cfg.get('block')} "
-          f"mid={cfg.get('mid_block')}  backbone={'고정' if args.freeze_backbone else '학습'}")
+          f"mid={cfg.get('mid_block')}  backbone={'고정' if args.freeze_backbone else '학습'}  "
+          f"stem={'학습(원신호)' if args.unfreeze_stem else '고정(토큰)'}"
+          + (f"  학습 crop {args.raw_crop} seg ({args.raw_crop/360:.1f}h)" if args.unfreeze_stem else ""))
     for s in ("train", "val", "test"):
         print(f"  {s:<5s} {len(ds[s]):>5,} record / 환자 {len(set(ds[s].pid)):>4,} / "
               f"양성 {int(ds[s].y.sum()):>4,} ({ds[s].y.mean():.1%})")
@@ -156,6 +195,12 @@ def main():
         raise SystemExit("train 에 양성/음성이 모두 있어야 합니다.")
 
     groups = param_groups(model, args.lr, args.weight_decay)
+    if args.unfreeze_stem:                         # stem 은 가장 낮은 LR 로
+        st = {id(p) for p in model.enc.stem.parameters()}
+        for g in groups:
+            g["params"] = [p for p in g["params"] if id(p) not in st]
+        groups.append({"params": list(model.enc.stem.parameters()),
+                       "lr": args.stem_lr, "weight_decay": 0.0})
     if not args.freeze_backbone:                   # backbone 은 낮은 LR 로 따로
         bb = {id(p) for p in model.enc.backbone.parameters()}
         for g in groups:
@@ -181,14 +226,14 @@ def main():
         for b in DataLoader(ds["train"], batch_size=args.batch, shuffle=True, drop_last=True,
                             num_workers=args.workers):
             with autocast(device, amp):
-                logit = model(b["tokens"].to(device), b["tod"].to(device), b["pad"].to(device))
+                logit = model(b, device)
                 loss = lossf(logit.float(), b["y"].to(device))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step()
             tot += loss.item(); n += 1
-        _, (va, vap, _) = evaluate(model, ds["val"], device, args.batch, amp, boot=0)
+        _, (va, vap, _) = evaluate(model, ds["val"], device, eval_batch, amp, boot=0)
         print(f"  epoch {ep+1:>3}/{args.epochs}  loss {tot/max(n,1):.4f}  "
               f"val 환자 AUROC {va:.3f}  ({time.time()-t0:.0f}s)", flush=True)
         logger.log({"epoch": ep + 1, "loss": tot / max(n, 1), "val_pat_auroc": va, "val_pat_auprc": vap})
@@ -202,10 +247,11 @@ def main():
 
     from .common import load_checkpoint
     load_checkpoint(os.path.join(args.out, "best.pt"), model, map_location=device)
-    probs, (ta, tap, ci) = evaluate(model, ds["test"], device, args.batch, amp, args.boot)
+    probs, (ta, tap, ci) = evaluate(model, ds["test"], device, eval_batch, amp, args.boot)
     print(f"\n[test] 환자 AUROC {ta:.3f} [{ci[0]:.3f}-{ci[1]:.3f}]  환자 AUPRC {tap:.3f}"
           f"   (best epoch {best['epoch']}, val {best['val_auroc']:.3f})")
     res = {"task": args.task, "encoder": args.encoder, "freeze_backbone": args.freeze_backbone,
+           "unfreeze_stem": args.unfreeze_stem,
            "best_epoch": best["epoch"], "val_pat_auroc": best["val_auroc"],
            "test_pat_auroc": ta, "test_pat_auprc": tap, "test_ci_lo": ci[0], "test_ci_hi": ci[1],
            "n_test_pos_pat": int(np.unique(ds["test"].pid[ds["test"].y == 1]).size)}
