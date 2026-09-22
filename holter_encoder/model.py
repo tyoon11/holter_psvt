@@ -272,8 +272,30 @@ class HolterEncoder(nn.Module):
             outs.append(tok)
         return torch.cat(outs, 0).reshape(B, S, -1)
 
+    def encode_segments_windowed(self, segments, grad_start, grad_len, checkpoint=True):
+        """전체는 gradient 없이, 지정 구간만 gradient 와 함께 stem 을 통과시킨다.
+
+        stem 까지 학습하면서 24시간 문맥을 그대로 두기 위한 장치다. 학습 때만
+        짧은 구간을 쓰면 pooling 과 상위 해상도 블록이 보는 길이가 평가와 달라져
+        성능이 떨어진다. 메모리는 구간 길이에만 비례한다.
+        """
+        with torch.no_grad():
+            base = self.encode_segments(segments, checkpoint=False)
+        tokens = base.detach()
+        if grad_len <= 0 or not torch.is_grad_enabled():
+            return tokens
+        B, S = segments.shape[:2]
+        rows = []
+        for b in range(B):
+            s = min(int(grad_start[b]), max(0, S - grad_len))
+            e = min(s + grad_len, S)
+            g = self.encode_segments(segments[b:b + 1, s:e], checkpoint=checkpoint)
+            idx = torch.arange(s, e, device=tokens.device)
+            rows.append(tokens[b:b + 1].index_copy(1, idx, g))
+        return torch.cat(rows, 0)
+
     def forward(self, segments=None, tokens=None, tod=None, mask=None,
-                checkpoint=True):
+                checkpoint=True, grad_start=None, grad_len=0):
         """
         Args:
             segments: (B, S, C, seg_len) 원신호 — tokens 와 택일
@@ -285,7 +307,10 @@ class HolterEncoder(nn.Module):
         """
         assert (segments is None) ^ (tokens is None), "segments 또는 tokens 중 하나만"
         if tokens is None:
-            tokens = self.encode_segments(segments, checkpoint=checkpoint)
+            if grad_len > 0 and grad_start is not None:
+                tokens = self.encode_segments_windowed(segments, grad_start, grad_len, checkpoint)
+            else:
+                tokens = self.encode_segments(segments, checkpoint=checkpoint)
         stem_tokens = tokens
 
         x = tokens

@@ -33,7 +33,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from .common import (CSVLogger, autocast, cosine_with_warmup, describe_device, ensure_kernel_cache,
-                     limit_cpu_threads, param_groups, save_checkpoint, setup_distributed, unwrap)
+                     limit_cpu_threads, load_checkpoint, param_groups, save_checkpoint,
+                     setup_distributed, unwrap)
 from .data import RawWindowDataset, TokenDataset, load_records
 from .embed import build_from_checkpoint
 
@@ -75,25 +76,56 @@ class LabeledTokens(Dataset):
 
 
 class Classifier(nn.Module):
-    """인코더 + attention pooling + 선형 분류기. 토큰 또는 원신호를 받는다."""
+    """인코더 + attention pooling + 선형 분류기. 토큰 또는 원신호를 받는다.
 
-    def __init__(self, enc, dropout=0.2):
+    grad_seg > 0 이면 원신호 학습 때 stem 의 gradient 를 무작위 구간으로 제한한다
+    (문맥 길이는 24시간 그대로). eval_window > 0 이면 평가를 창 단위로 쪼개
+    창별 점수의 최댓값을 record 점수로 쓴다 (다중 인스턴스 추론).
+    """
+
+    def __init__(self, enc, dropout=0.2, grad_seg=0, eval_window=0):
         super().__init__()
         self.enc = enc
+        self.grad_seg, self.eval_window = grad_seg, eval_window
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(enc.d_model, 1))
+
+    def _score(self, segments, tod, pad, checkpoint, grad_start=None):
+        out = self.enc(segments=segments, tod=tod, mask=pad, checkpoint=checkpoint,
+                       grad_start=grad_start, grad_len=self.grad_seg if grad_start is not None else 0)
+        return self.head(out["record"]).squeeze(-1)
+
+    def _windowed(self, x, tod, pad, checkpoint):
+        """하루를 창으로 나눠 창별 점수를 내고 최댓값을 취한다."""
+        B, S, C, L = x.shape
+        w = self.eval_window
+        n = (S + w - 1) // w
+        if n * w > S:                                   # 마지막 창을 0 으로 채우고 mask
+            k = n * w - S
+            x = torch.cat([x, x.new_zeros(B, k, C, L)], 1)
+            tod = torch.cat([tod, tod.new_full((B, k), float("nan"))], 1)
+            pad = torch.cat([pad, pad.new_ones(B, k)], 1)
+        logit = self._score(x.reshape(B * n, w, C, L), tod.reshape(B * n, w),
+                            pad.reshape(B * n, w), checkpoint).reshape(B, n)
+        dead = pad.reshape(B, n, w).all(-1)              # 전부 padding 인 창은 제외
+        return logit.masked_fill(dead, float("-inf")).max(1).values
 
     def forward(self, batch, device, clip=20.0, checkpoint=True):
         tod, pad = batch["tod"].to(device), batch["pad"].to(device)
         if "tokens" in batch:
             out = self.enc(tokens=batch["tokens"].to(device), tod=tod, mask=pad)
-        else:
-            x = batch["x"].to(device)                       # (B, S, C, L) int16
-            g = batch["gain"].to(device)
-            x = x.float() * g[:, None, :, None]
-            if clip:
-                x = x.clamp_(-clip, clip)
-            out = self.enc(segments=x, tod=tod, mask=pad, checkpoint=checkpoint)
-        return self.head(out["record"]).squeeze(-1)
+            return self.head(out["record"]).squeeze(-1)
+        x = batch["x"].to(device)                           # (B, S, C, L) int16
+        g = batch["gain"].to(device)
+        x = x.float() * g[:, None, :, None]
+        if clip:
+            x = x.clamp_(-clip, clip)
+        if self.eval_window and not self.training:
+            return self._windowed(x, tod, pad, checkpoint)
+        start = None
+        if self.grad_seg and self.training:
+            span = max(1, x.size(1) - self.grad_seg + 1)
+            start = torch.randint(0, span, (x.size(0),))
+        return self._score(x, tod, pad, checkpoint, start)
 
 
 def patient_metrics(prob, y, pid, boot=1000, seed=0):
@@ -150,6 +182,13 @@ def main():
     ap.add_argument("--raw-crop", type=int, default=720,
                     help="원신호 학습 시 자를 세그먼트 수 (720 = 2시간)")
     ap.add_argument("--eval-crop", type=int, default=8640, help="평가 시 사용할 세그먼트 수")
+    ap.add_argument("--stem-grad-seg", type=int, default=0,
+                    help="원신호 학습에서 24시간을 그대로 두고 stem gradient 만 이 길이로 제한 "
+                         "(0 = 끔, --raw-crop 으로 짧게 잘라 학습)")
+    ap.add_argument("--eval-window", type=int, default=0,
+                    help="평가를 이 길이의 창으로 나눠 창별 점수의 최댓값을 쓴다 (0 = 하루 통째)")
+    ap.add_argument("--eval-only", default=None,
+                    help="체크포인트를 읽어 평가만 한다 (학습 없음)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--boot", type=int, default=1000)
     ap.add_argument("--gpus", default=None)
@@ -167,7 +206,8 @@ def main():
     if args.unfreeze_stem and not args.meta_dir:
         raise SystemExit("--unfreeze-stem 에는 --meta-dir (prep_meta 결과)가 필요합니다.")
     enc, cfg = build_from_checkpoint(args.encoder, device)
-    model = Classifier(enc, args.dropout).to(device)
+    model = Classifier(enc, args.dropout, grad_seg=args.stem_grad_seg,
+                       eval_window=args.eval_window).to(device)
     if not args.unfreeze_stem:                     # 입력이 캐시 토큰이면 stem 은 쓰이지 않는다
         for p in model.enc.stem.parameters():
             p.requires_grad_(False)
@@ -176,10 +216,12 @@ def main():
             p.requires_grad_(False)
 
     raw = args.meta_dir if args.unfreeze_stem else None
+    # stem gradient 를 구간으로 제한하면 학습도 하루 전체를 본다 (평가와 길이를 맞춘다).
+    train_crop = args.eval_crop if args.stem_grad_seg else args.raw_crop
     # 평가는 24시간 전체를 통과시킨다. 원신호 경로에서는 한 건만 해도 8,640 세그먼트다.
     eval_batch = args.eval_batch or (1 if raw else args.batch)
     ds = {s: LabeledTokens(load_records(args.splits, s), args.tokens, col,
-                           crop=(args.raw_crop if (raw and s == "train") else
+                           crop=(train_crop if (raw and s == "train") else
                                  args.eval_crop if raw else args.crop),
                            random_crop=(s == "train"), seed=args.seed, raw_meta_dir=raw)
           for s in ("train", "val", "test")}
@@ -187,12 +229,24 @@ def main():
     print(f"[finetune] {args.task}  {describe_device(device)}  block={cfg.get('block')} "
           f"mid={cfg.get('mid_block')}  backbone={'고정' if args.freeze_backbone else '학습'}  "
           f"stem={'학습(원신호)' if args.unfreeze_stem else '고정(토큰)'}"
-          + (f"  학습 crop {args.raw_crop} seg ({args.raw_crop/360:.1f}h)" if args.unfreeze_stem else ""))
+          + (f"  학습 {train_crop} seg ({train_crop/360:.1f}h)" if args.unfreeze_stem else "")
+          + (f"  stem gradient 구간 {args.stem_grad_seg} seg" if args.stem_grad_seg else "")
+          + (f"  평가 창 {args.eval_window} seg ({args.eval_window/360:.1f}h) 최댓값"
+             if args.eval_window else ""))
     for s in ("train", "val", "test"):
         print(f"  {s:<5s} {len(ds[s]):>5,} record / 환자 {len(set(ds[s].pid)):>4,} / "
               f"양성 {int(ds[s].y.sum()):>4,} ({ds[s].y.mean():.1%})")
     if n_pos == 0 or n_pos == len(ds["train"]):
         raise SystemExit("train 에 양성/음성이 모두 있어야 합니다.")
+
+    if args.eval_only:                             # 학습 없이 평가 방식만 바꿔 본다
+        load_checkpoint(args.eval_only, model, map_location=device)
+        probs, (ta, tap, ci) = evaluate(model, ds["test"], device, eval_batch,
+                                        not args.no_amp, args.boot)
+        print(f"\n[test] 환자 AUROC {ta:.3f} [{ci[0]:.3f}-{ci[1]:.3f}]  환자 AUPRC {tap:.3f}"
+              f"   ({args.eval_only})")
+        np.save(os.path.join(args.out, "test_probs_eval.npy"), probs)
+        return
 
     groups = param_groups(model, args.lr, args.weight_decay)
     if args.unfreeze_stem:                         # stem 은 가장 낮은 LR 로
@@ -245,7 +299,6 @@ def main():
             save_checkpoint(os.path.join(args.out, "best.pt"), model, None, None, ep + 1,
                             {"args": vars(args), "config": cfg})
 
-    from .common import load_checkpoint
     load_checkpoint(os.path.join(args.out, "best.pt"), model, map_location=device)
     probs, (ta, tap, ci) = evaluate(model, ds["test"], device, eval_batch, amp, args.boot)
     print(f"\n[test] 환자 AUROC {ta:.3f} [{ci[0]:.3f}-{ci[1]:.3f}]  환자 AUPRC {tap:.3f}"

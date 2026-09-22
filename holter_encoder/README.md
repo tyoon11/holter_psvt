@@ -184,6 +184,21 @@ PSVT 처럼 사건이 짧고 드문 과제에서 쓴다. 학습은 `--raw-crop` 
 라벨이 record 단위라 양성 record 라도 잘린 구간에 사건이 없을 수 있다(다중 인스턴스 학습).
 `--meta-dir` 가 반드시 필요하고, 평가 배치는 기본 1 이다 (`--eval-batch`).
 
+학습 구간이 평가 길이보다 짧으면 pooling 과 상위 블록이 보는 길이가 달라져 손해를 본다.
+둘 중 하나로 맞춘다.
+
+```bash
+# (a) 24시간을 그대로 보면서 stem gradient 만 2시간으로 제한 — 길이가 학습·평가 동일
+python -m holter_encoder.finetune ... --unfreeze-stem --stem-grad-seg 720 --batch 1
+
+# (b) 2시간 crop 학습 + 창 단위 최댓값 평가 (다중 인스턴스 추론)
+python -m holter_encoder.finetune ... --unfreeze-stem --raw-crop 720 --eval-window 720
+
+# 학습한 체크포인트를 평가 방식만 바꿔 다시 재보기
+python -m holter_encoder.finetune ... --unfreeze-stem --eval-only $RUN/ft_psvt_attn_e2e/best.pt \
+    --eval-window 720
+```
+
 경로는 `$W` 같은 축약이 아니라 위의 `$OUT`/`$RUN` 을 쓴다. 셸에서 비어 있으면
 `--out` 이 `/runs/...` 가 되어 PermissionError 가 난다.
 
