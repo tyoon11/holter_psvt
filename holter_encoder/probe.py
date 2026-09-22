@@ -43,16 +43,39 @@ def patient_level(prob, y, pid):
 
 
 def boot_ci(y, p, pid, n=1000, seed=0):
-    """환자 단위 부트스트랩 AUROC 95% CI."""
+    """환자 단위 부트스트랩 AUROC 95% CI.
+
+    환자로 묶어 리샘플링한 뒤 record 단위 AUROC 를 재면, 옆에 찍히는 점추정
+    (환자 단위 AUROC) 과 추정량이 달라진다. 먼저 환자로 집계하고 환자를 뽑는다.
+    """
+    pp, py = patient_level(p, y, pid)
     rng = np.random.default_rng(seed)
-    pids = np.unique(pid)
-    idx = {q: np.flatnonzero(pid == q) for q in pids}
     out = []
     for _ in range(n):
-        take = np.concatenate([idx[q] for q in rng.choice(pids, len(pids))])
-        if len(np.unique(y[take])) == 2:
-            out.append(roc_auc_score(y[take], p[take]))
+        take = rng.integers(0, len(py), len(py))
+        if len(np.unique(py[take])) == 2:
+            out.append(roc_auc_score(py[take], pp[take]))
     return (np.percentile(out, 2.5), np.percentile(out, 97.5)) if out else (np.nan, np.nan)
+
+
+def paired_delta(y, pa, pb, pid, n=1000, seed=0):
+    """같은 환자에서 두 예측의 환자 단위 AUROC 차이와 95% CI.
+
+    독립 CI 두 개가 겹치는지 눈으로 보는 것은 검정이 아니다. 같은 환자를 함께
+    리샘플링하면 공통 변동이 상쇄되어 훨씬 좁은 구간이 나온다.
+    """
+    aa, py = patient_level(pa, y, pid)
+    bb, _ = patient_level(pb, y, pid)
+    rng = np.random.default_rng(seed)
+    d0 = roc_auc_score(py, aa) - roc_auc_score(py, bb)
+    out = []
+    for _ in range(n):
+        take = rng.integers(0, len(py), len(py))
+        if len(np.unique(py[take])) == 2:
+            out.append(roc_auc_score(py[take], aa[take]) - roc_auc_score(py[take], bb[take]))
+    if not out:
+        return d0, (np.nan, np.nan), np.nan
+    return d0, (np.percentile(out, 2.5), np.percentile(out, 97.5)), float(np.mean(np.array(out) > 0))
 
 
 def fit_eval(Xtr, ytr, Xva, yva, Xte, yte, pid_te, seed=0):
@@ -95,7 +118,8 @@ def cv_eval(X, y, pid, folds=5, seed=0, boot=1000):
     m = np.isfinite(oof)
     pp, py = patient_level(oof[m], y[m], pid[m])
     lo, hi = boot_ci(y[m], oof[m], pid[m], n=boot, seed=seed)
-    return {"val_auroc": np.nan,
+    return {"_oof": (oof, m),                    # 짝지은 비교용. CSV 로 나가기 전에 뺀다
+            "val_auroc": np.nan,
             "rec_auroc": roc_auc_score(y[m], oof[m]), "rec_auprc": average_precision_score(y[m], oof[m]),
             "pat_auroc": roc_auc_score(py, pp), "pat_auprc": average_precision_score(py, pp),
             "pat_ci": (lo, hi), "n_test_pos_pat": int(py.sum()), "n_test_pat": len(py)}
@@ -284,6 +308,9 @@ HOWTO = """
   - report(벤더 리포트 지표: 상심실·심실 이소성, 빈맥·AF 비율, 잡음)를 enc 가 못 넘으면
     인코더는 리포트에 이미 있는 것을 재발견한 것이다. enc+report 가 report 보다 오르는
     만큼이 파형에서 새로 얻은 정보다
+  - [짝지은 차이] 는 같은 환자에서 enc 와 기준선의 AUROC 차이를 함께 리샘플링한 것이다.
+    독립 CI 두 개가 겹치는지 눈으로 보는 것은 검정이 아니다. P(Δ>0) 가 0.975 를 넘으면
+    그 기준선 대비 우위가 통계적으로 선다
   - CV 행은 SSL 이 보지 않은 val+test 환자만으로 돌린 교차검증이다. 양성이 적은
     태스크(LongQT)는 단일 test 점추정보다 이쪽을 근거로 삼는다
 """
@@ -331,16 +358,30 @@ def run_tasks(name, feat_name, X, D, feats, z, split, pid, keep_all, args, rows)
                           f"{mean['pat_auroc']:>13.3f}{spread:>18s}{mean['pat_auprc']:>12.3f}")
             if args.cv:
                 pool = ok & np.isin(split, ["val", "test"])
+                oofs = {}
                 for fname, F in feats.items():
                     if len(np.unique(y[pool])) < 2:
                         continue
                     r = cv_eval(F[pool], y[pool], pid[pool], args.cv_folds, args.seed, args.boot)
+                    oofs[fname] = r.pop("_oof")
                     lo, hi = r["pat_ci"]
                     print(f"    {fname:<9s}{'CV':>6s}{'-':>7s}{r['rec_auroc']:>12.3f}"
                           f"{r['pat_auroc']:>13.3f}{f'[{lo:.3f}-{hi:.3f}]':>18s}{r['pat_auprc']:>12.3f}")
                     rows.append({"emb": name, "features": feat_name, "task": task,
                                  "feature_set": fname, "train_frac": "cv", **r,
                                  "pat_ci_lo": lo, "pat_ci_hi": hi})
+                if "enc" in oofs:                # enc 대비 각 기준선의 짝지은 차이
+                    oe, me = oofs["enc"]
+                    print(f"    {'[짝지은 차이] enc − 기준선':<40s}{'Δ':>7s}{'95% CI':>18s}{'P(Δ>0)':>9s}")
+                    for base in ("demo", "demo_nl", "meta", "report", "encage"):
+                        if base not in oofs:
+                            continue
+                        ob, mb = oofs[base]
+                        mm = me & mb          # 두 쪽 모두 out-of-fold 예측이 있는 record
+                        d, (dlo, dhi), pgt = paired_delta(y[pool][mm], oe[mm], ob[mm],
+                                                          pid[pool][mm], n=args.boot, seed=args.seed)
+                        print(f"      {('enc − ' + base):<38s}{d:>+7.3f}"
+                              f"{f'[{dlo:+.3f}-{dhi:+.3f}]':>18s}{pgt:>9.3f}")
             npos = rows[-1]["n_test_pos_pat"] if rows else 0
             if npos < 30:
                 print(f"    ** test 양성 환자 {npos}명 — CI 가 넓으니 점추정만으로 비교하지 말 것 **")
