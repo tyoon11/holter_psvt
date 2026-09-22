@@ -23,7 +23,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, RidgeCV
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.pipeline import make_pipeline
@@ -121,6 +121,9 @@ def main():
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--no-meta", action="store_true",
                     help="촬영 조건(meta) 기준선을 계산하지 않는다")
+    ap.add_argument("--enc-age", action="store_true",
+                    help="인코더로 나이를 예측한 뒤, 그 예측 나이만으로 라벨을 맞춰 본다. "
+                         "나이 구간 one-hot 이 못 잡는 미세한 연령 차이가 성능의 정체인지 가른다")
     ap.add_argument("--report-csv", default=None,
                     help="tools/report_features.py 결과. 벤더 리포트 지표 기준선을 추가한다")
     ap.add_argument("--age-band", type=float, nargs=2, default=None, metavar=("LO", "HI"),
@@ -217,6 +220,22 @@ def main():
             feats = {k: v for k, v in feats.items() if not k.startswith("enc")}
             feats["enc"] = X
             feats["enc+demo"] = np.concatenate([X, D], 1)
+            if args.enc_age:
+                # 나이 회귀는 train 환자로만 적합한다 (val/test 로 새면 기준선이 부풀려진다).
+                atr = (split == "train") & np.isfinite(age)
+                if atr.sum() > 50:
+                    rg = make_pipeline(StandardScaler(),
+                                       RidgeCV(alphas=np.logspace(-2, 3, 12)))
+                    rg.fit(X[atr], age[atr])
+                    age_hat = rg.predict(X)
+                    ev = np.isfinite(age) & np.isin(split, ["val", "test"])
+                    mae = float(np.mean(np.abs(age_hat[ev] - age[ev])))
+                    rr = float(np.corrcoef(age_hat[ev], age[ev])[0, 1])
+                    print(f"  인코더 → 나이: val+test MAE {mae:.1f}세, r {rr:.3f}"
+                          f"  (실제 나이 중앙값 {np.nanmedian(age[ev]):.0f}세)")
+                    # 예측 나이 한 축 + 성별·HR. 이것만으로 enc 를 따라잡으면
+                    # 그 태스크에서 인코더가 보는 것은 질환이 아니라 생리학적 나이다.
+                    feats["encage"] = np.concatenate([age_hat[:, None], D[:, 1:]], 1)
             if R is not None:
                 feats["enc+report"] = np.concatenate([X, R, D], 1)
             print(f"\n{'='*78}\n[{name}]  특징={feat_name}  X {X.shape}\n{'='*78}")
@@ -231,6 +250,9 @@ def main():
 HOWTO = """
 [읽는 법]
   - enc 가 demo 를 못 넘으면 인코더가 질환 정보를 못 담은 것이다 (특히 TOF)
+  - encage 는 인코더가 예측한 나이 한 축(+성별·HR)만 쓴 기준선이다. demo_nl 이 낮은데
+    encage 가 enc 에 근접하면, 인코더는 질환이 아니라 심전도에서 읽은 생리학적 나이를
+    쓰고 있다 (10세 구간 one-hot 은 몇 년 차이를 잡지 못한다)
   - demo_nl 은 나이를 10세 구간 one-hot + 제곱항으로 준 기준선이다. demo 는 우연인데
     demo_nl 이 enc 에 근접하면, 그 태스크는 질환이 아니라 연령대 식별이다
   - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다
