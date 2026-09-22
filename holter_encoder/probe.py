@@ -111,6 +111,9 @@ def main():
                     help="여러 개를 주면 한 번에 비교한다. stem 은 Stage A 만의 표현이라 "
                          "Stage B backbone 의 기여를 분리해서 볼 수 있다")
     ap.add_argument("--fractions", type=float, nargs="*", default=[0.1, 0.25, 1.0])
+    ap.add_argument("--frac-repeats", type=int, default=3,
+                    help="라벨 일부만 쓰는 행을 서로 다른 추출로 몇 번 반복할지. "
+                         "한 번만 뽑으면 운 나쁜 추출 하나에 결론이 흔들린다")
     ap.add_argument("--boot", type=int, default=1000)
     ap.add_argument("--cv", action="store_true",
                     help="val+test 환자를 모아 환자 단위 5-fold 교차검증도 수행 "
@@ -221,7 +224,9 @@ HOWTO = """
   - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는
     질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험
   - --age-band 로 나이를 맞춘 뒤에도 남는 성능이 나이 교란을 뺀 실력이다
-  - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다
+  - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다.
+    "10%×3" 은 서로 다른 환자 추출 3회 평균이고 CI 자리의 범위는 추출 간 흔들림이다
+    (부트스트랩 CI 가 아니다). 범위가 넓으면 그 비율의 점추정은 믿을 게 못 된다
   - 특징 stem(Stage A 만) 대비 mean(Stage B 통과)이 나아지지 않으면 backbone 이
     기여하지 못한 것이다. stem 은 세 백본에서 같은 값이라 한 번만 보면 된다
   - report(벤더 리포트 지표: 상심실·심실 이소성, 빈맥·AF 비율, 잡음)를 enc 가 못 넘으면
@@ -241,20 +246,37 @@ def run_tasks(name, feat_name, X, D, feats, z, split, pid, keep_all, args, rows)
                   f"{'95% CI':>18s}{'환자 AUPRC':>12s}")
             for fname, F in feats.items():
                 for frac in (args.fractions if fname.startswith("enc") else [1.0]):
-                    tr = ok & (split == "train"); va = ok & (split == "val"); te = ok & (split == "test")
-                    if frac < 1.0:                       # 환자 단위로 train 일부만
-                        rng = np.random.default_rng(args.seed)
-                        tp = np.unique(pid[tr]); keep = set(rng.choice(tp, max(2, int(len(tp) * frac)), replace=False))
-                        tr = tr & np.array([p in keep for p in pid])
-                    if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
+                    reps = args.frac_repeats if frac < 1.0 else 1
+                    got = []
+                    for rep in range(reps):
+                        tr = ok & (split == "train")
+                        va = ok & (split == "val"); te = ok & (split == "test")
+                        if frac < 1.0:                   # 환자 단위로 train 일부만
+                            rng = np.random.default_rng(args.seed + 1000 * rep)
+                            tp = np.unique(pid[tr])
+                            keep = set(rng.choice(tp, max(2, int(len(tp) * frac)), replace=False))
+                            tr = tr & np.array([p in keep for p in pid])
+                        if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
+                            continue
+                        r = fit_eval(F[tr], y[tr], F[va], y[va], F[te], y[te], pid[te], seed=args.seed)
+                        got.append(r)
+                        lo, hi = r["pat_ci"]
+                        rows.append({"emb": name, "features": feat_name, "task": task,
+                                     "feature_set": fname, "train_frac": frac, "rep": rep, **r,
+                                     "pat_ci_lo": lo, "pat_ci_hi": hi})
+                    if not got:
                         continue
-                    r = fit_eval(F[tr], y[tr], F[va], y[va], F[te], y[te], pid[te], seed=args.seed)
-                    lo, hi = r["pat_ci"]
-                    print(f"    {fname:<9s}{frac:>6.0%}{r['val_auroc']:>7.3f}{r['rec_auroc']:>12.3f}"
-                          f"{r['pat_auroc']:>13.3f}{f'[{lo:.3f}-{hi:.3f}]':>18s}{r['pat_auprc']:>12.3f}")
-                    rows.append({"emb": name, "features": feat_name, "task": task,
-                                 "feature_set": fname, "train_frac": frac, **r,
-                                 "pat_ci_lo": lo, "pat_ci_hi": hi})
+                    pat = np.array([g["pat_auroc"] for g in got])
+                    mean = {k: float(np.mean([g[k] for g in got]))
+                            for k in ("val_auroc", "rec_auroc", "pat_auroc", "pat_auprc")}
+                    if len(got) > 1:                     # 추출 간 흔들림을 CI 자리에 보여준다
+                        spread = f"추출 {pat.min():.3f}-{pat.max():.3f}"
+                    else:
+                        lo, hi = got[0]["pat_ci"]
+                        spread = f"[{lo:.3f}-{hi:.3f}]"
+                    tag = f"{frac:>5.0%}×{len(got)}" if len(got) > 1 else f"{frac:>6.0%}"
+                    print(f"    {fname:<9s}{tag:>6s}{mean['val_auroc']:>7.3f}{mean['rec_auroc']:>12.3f}"
+                          f"{mean['pat_auroc']:>13.3f}{spread:>18s}{mean['pat_auprc']:>12.3f}")
             if args.cv:
                 pool = ok & np.isin(split, ["val", "test"])
                 for fname, F in feats.items():
