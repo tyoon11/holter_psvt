@@ -87,7 +87,13 @@ def main():
             print(f"  {i:,}/{len(df):,}", end="\r", flush=True)
     print()
     feat = pd.DataFrame(rows)
-    out = pd.concat([df.reset_index(drop=True), feat], axis=1)
+    # splits.csv 에도 duration_h·n_beats 가 있다. 이름이 겹치면 h5 attrs 쪽을 쓴다
+    # (같은 이름이 둘이면 out[c] 가 DataFrame 이 되어 아래 계산이 깨진다).
+    dup = [c for c in feat.columns if c in df.columns]
+    if dup:
+        print(f"  이름이 겹쳐 h5 attrs 값을 쓴다: {', '.join(dup)}")
+    out = pd.concat([df.drop(columns=dup).reset_index(drop=True), feat], axis=1)
+    assert out.columns.is_unique, f"중복 컬럼: {out.columns[out.columns.duplicated()].tolist()}"
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     out.to_csv(args.out, index=False)
 
