@@ -121,6 +121,10 @@ def main():
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--no-meta", action="store_true",
                     help="촬영 조건(meta) 기준선을 계산하지 않는다")
+    ap.add_argument("--subsample", type=float, default=None, metavar="F",
+                    help="나이는 그대로 두고 환자의 F 비율만 무작위로 남긴다. --age-band 로 "
+                         "줄어든 성능이 나이 때문인지 표본이 줄어서인지 가르는 대조군이다. "
+                         "--seed 를 바꿔 여러 번 돌릴 것")
     ap.add_argument("--enc-age", action="store_true",
                     help="인코더로 나이를 예측한 뒤, 그 예측 나이만으로 라벨을 맞춰 본다. "
                          "나이 구간 one-hot 이 못 잡는 미세한 연령 차이가 성능의 정체인지 가른다")
@@ -209,6 +213,13 @@ def main():
             M = fill(m[meta_cols].to_numpy(dtype=float))
             feats["meta"] = np.concatenate([M, D], 1)      # 촬영 조건 + 인구학
         keep_all = np.ones(len(rec), bool)
+        if args.subsample:               # 나이 구간과 같은 크기의 무작위 대조군
+            rs = np.random.default_rng(args.seed)
+            up = np.unique(pid)
+            keep_pid = set(rs.choice(up, max(2, int(len(up) * args.subsample)), replace=False))
+            keep_all &= np.array([p in keep_pid for p in pid])
+            print(f"  환자 {args.subsample:.0%} 무작위 추출(seed {args.seed}): "
+                  f"{int(keep_all.sum()):,}/{len(rec):,} record")
         if args.age_band:
             lo, hi = args.age_band
             a = m["age_num"].values
@@ -258,6 +269,8 @@ HOWTO = """
   - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다
   - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는
     질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험
+  - --subsample 은 나이를 건드리지 않고 표본만 같은 크기로 줄인 대조군이다. --age-band
+    결과가 이것과 비슷하면 떨어진 이유는 나이가 아니라 표본 감소다
   - --age-band 로 나이를 맞춘 뒤에도 남는 성능이 나이 교란을 뺀 실력이다. 단 구간은
     이 코호트에 맞춰 잡을 것 — 소아 데이터라 환자의 83%가 20세 미만이다.
     PSVT/LongQT 는 10~19, TOF 는 10~29 가 두 클래스가 함께 있는 구간이다.
