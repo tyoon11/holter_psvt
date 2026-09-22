@@ -192,16 +192,15 @@ backbone·tod(Stage B) 를 담는다. attention pool 은 사전학습되지 않�
   **환자 부트스트랩**으로 낸다.
 - 세 특징을 나란히 비교한다.
 
-| 특징 | 뜻 |
-|---|---|
-| `demo` | 나이 + 평균 HR + 성별. **교란 기준선** |
-| `enc` | 인코더 임베딩 |
-| `enc+demo` | 둘 다. `demo` 대비 상승폭이 인코더의 순수 기여분 |
+교란 기준선은 다섯 종류다 — `demo`(나이·성별·HR), `demo_nl`(비선형 나이),
+`meta`(촬영 조건), `report`(벤더 리포트 지표), `encage`(인코더가 예측한 나이).
+기준선과의 비교는 **짝지은 부트스트랩**으로 한다. 독립 CI 두 개가 겹치는지 보는 것은
+검정이 아니다.
 
-**TOF 는 `demo` 만으로 test AUROC 0.884** 가 나온다(코호트가 성인 중심이라).
-그래서 `enc` 단독 수치로 질환 학습을 주장할 수 없다.
-LongQT 는 test 양성 환자가 14명뿐이라 `--cv`(SSL 이 보지 않은 val+test 환자로 5-fold)를
-근거로 삼는다. `--fractions` 로 라벨 10%/25%/100% 도 함께 본다.
+LongQT 는 test 양성 환자가 24명뿐이라 `--cv`(SSL 이 보지 않은 val+test 환자로 5-fold)를
+근거로 삼는다. `--fractions` 로 라벨 10%/25%/100% 도 함께 본다 (기본 3회 추출 평균).
+
+**기준선 정의·검정 방법·실제 결과는 [EXPERIMENTS.md](EXPERIMENTS.md)** 에 있다.
 
 ---
 
@@ -248,13 +247,14 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe --cv \
 | manifest / split | 완료 | 적격 6,454 record, 환자 3,826. 유병률 split 간 차이 0.6%p 이내 |
 | Stage A | 완료 | 30,000 step, 약 58분, 70,000+ seg/s. val `rec` 1.43 → **1.14**, `beat` **0.0102** |
 | 토큰 캐시 | 완료 | record 당 0.6초 |
-| Stage B (s4) | 진행 중 | 91 record/s, 20,000 step ≈ 2시간. 손실 0.39 → 0.29 (80 step) |
-| Stage B (mamba / mamba+attn) | 예정 | |
-| embed / probe | 예정 | |
+| Stage B (s4 / mamba / mamba+attn) | 완료 | 세 백본 비교 완료 |
+| embed / probe | 완료 | 기준선 5종 + 짝지은 검정. [EXPERIMENTS.md](EXPERIMENTS.md) |
+| Stage C 미세조정 | 완료 (PSVT) | test 환자 AUROC 0.768 [0.698-0.831] |
 
 ### 아직 정하지 않은 것
 
-- **백본**: s4 / mamba / mamba+attn 중 무엇을 쓸지. downstream 결과로 정한다.
+- **백본**: probe 는 `mamba` 가, 미세조정은 `mamba+attn` 이 낫다. attention 층은 과제에
+  맞춰 학습해야 값을 낸다. 최종 선택은 용도에 따라 갈린다.
 - **Stage A·B 학습량**: val 곡선이 평평해지는 지점을 보고 줄이거나 늘린다.
 - **fiducial/유사도**: 현재 변환은 이 둘을 계산하지 않아 `seg/fiducial_feat`,
   `seg/similarity` 가 NaN 이다. 필요해지면 `--real-fiducial` 로 다시 변환해야 한다.
@@ -263,8 +263,9 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe --cv \
 ### 알려진 한계
 
 - LongQT·TOF 는 코호트 소속으로 라벨을 정의했다. 코호트마다 나이·평균 HR 분포가 달라
-  (TOF 22세/HR 75, PSVT 11세/HR 96) 모델이 질환 대신 인구학적 차이를 배울 수 있다.
-  반드시 `demo` 기준선과 함께 보고한다.
+  모델이 질환 대신 인구학적 차이를 배울 수 있다. 기준선 5종과 함께 보고한다.
+- **소아 코호트다.** 환자의 83%가 20세 미만이다. 나이 교란을 확인할 때 성인 기준
+  구간(15~45세)을 쓰면 양성의 4분의 3이 사라져 결론이 뒤집힌다.
 - 같은 신호가 다른 PID 로 들어간 묶음이 3개 있다. 원인 확인 필요.
 - lead 이름은 원본에 없어 확인 후 확정한 값이다. 채널 **순서**는 전 코호트에서 동일하다.
 
@@ -273,3 +274,4 @@ python -m holter_encoder.probe --splits $OUT/splits.csv --out $RUN/probe --cv \
 ## 변경 이력
 
 - 2026-09-17 최초 작성. Stage A 완료·토큰 캐시 완료·Stage B 진행 중 시점.
+- 2026-09-22 평가 절과 진행 현황 갱신. 실험 결과는 EXPERIMENTS.md 로 분리.
