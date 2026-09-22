@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--no-meta", action="store_true",
                     help="촬영 조건(meta) 기준선을 계산하지 않는다")
+    ap.add_argument("--report-csv", default=None,
+                    help="tools/report_features.py 결과. 벤더 리포트 지표 기준선을 추가한다")
     ap.add_argument("--age-band", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="이 나이 구간의 record 만 사용 (코호트 간 나이 차이 교란 확인용)")
     ap.add_argument("--seed", type=int, default=0)
@@ -141,6 +143,31 @@ def main():
     meta = meta.set_index("record_name")
     meta_cols = [c for c in META_COLS if c in meta.columns]
 
+    # 벤더 리포트 지표. meta 기준선에는 부정맥 지표가 없어서, 인코더가 "리포트에 이미
+    # 있는 것"을 재발견한 것인지 구분하지 못한다. 단일 지표 AUROC 와 달리 여기서는
+    # 전체를 넣어 적합시키므로 공정한 기준선이 된다.
+    REPORT_COLS = ["hr_min", "hr_avg", "hr_max", "tachy_beats", "tachy_pct",
+                   "brady_beats", "brady_pct", "vb_total", "vb_Isolated", "vb_Couplets",
+                   "vb_BigeminalCycles", "vb_run_count", "vb_run_TotalBeats",
+                   "sb_total", "sb_Isolated", "sb_Couplets", "sb_BigeminalCycles",
+                   "sb_run_count", "sb_run_TotalBeats", "PacedBeats_total", "BBBeats_total",
+                   "JunctionalBeats_total", "AberrantBeats_total",
+                   "NoisePercentage", "AFAFLPercentage"]
+    rep, rep_cols = None, []
+    if args.report_csv:
+        rep = pd.read_csv(args.report_csv, low_memory=False, dtype={"pid": str})
+        rep = rep.set_index("record_name")
+        dur = pd.to_numeric(rep.get("duration_h"), errors="coerce").replace(0, np.nan)
+        for c in REPORT_COLS:
+            if c in rep.columns:
+                rep[c] = pd.to_numeric(rep[c], errors="coerce")
+        for c in ("sb_total", "sb_run_count", "sb_Couplets", "vb_total", "vb_run_count"):
+            if c in rep.columns:                       # 기록 길이가 제각각이라 시간당 비율도
+                rep[f"{c}_per_h"] = rep[c] / dur
+                REPORT_COLS.append(f"{c}_per_h")
+        rep_cols = [c for c in REPORT_COLS if c in rep.columns]
+        print(f"  리포트 지표 {len(rep_cols)}개 ({args.report_csv})")
+
     rows = []
     for path in args.emb:
         z = np.load(path, allow_pickle=True)
@@ -157,6 +184,10 @@ def main():
 
         D = fill(np.stack([m["age_num"].values, m["hr"].values, m["male"].values], 1))
         feats = {"demo": D}          # enc / enc+demo 는 특징 종류마다 아래에서 채운다
+        R = None
+        if rep_cols:
+            R = fill(rep.reindex(rec)[rep_cols].to_numpy(dtype=float))
+            feats["report"] = np.concatenate([R, D], 1)    # 벤더 리포트 + 인구학
         if meta_cols and not args.no_meta:
             M = fill(m[meta_cols].to_numpy(dtype=float))
             feats["meta"] = np.concatenate([M, D], 1)      # 촬영 조건 + 인구학
@@ -172,6 +203,8 @@ def main():
             feats = {k: v for k, v in feats.items() if not k.startswith("enc")}
             feats["enc"] = X
             feats["enc+demo"] = np.concatenate([X, D], 1)
+            if R is not None:
+                feats["enc+report"] = np.concatenate([X, R, D], 1)
             print(f"\n{'='*78}\n[{name}]  특징={feat_name}  X {X.shape}\n{'='*78}")
             run_tasks(name, feat_name, X, D, feats, z, split, pid, keep_all, args, rows)
 
@@ -191,6 +224,9 @@ HOWTO = """
   - 10% 라벨에서 demo 대비 격차가 크면 SSL 사전학습이 제 몫을 한 것이다
   - 특징 stem(Stage A 만) 대비 mean(Stage B 통과)이 나아지지 않으면 backbone 이
     기여하지 못한 것이다. stem 은 세 백본에서 같은 값이라 한 번만 보면 된다
+  - report(벤더 리포트 지표: 상심실·심실 이소성, 빈맥·AF 비율, 잡음)를 enc 가 못 넘으면
+    인코더는 리포트에 이미 있는 것을 재발견한 것이다. enc+report 가 report 보다 오르는
+    만큼이 파형에서 새로 얻은 정보다
   - CV 행은 SSL 이 보지 않은 val+test 환자만으로 돌린 교차검증이다. 양성이 적은
     태스크(LongQT)는 단일 test 점추정보다 이쪽을 근거로 삼는다
 """
