@@ -165,6 +165,28 @@ A6000 에서 GPU 당 2,048 세그먼트(= 128 × 16)가 약 6 GB 수준이다.
 `segs-per-record` 는 파일 여는 비용을 나눠 갚는 장치이고, 너무 키우면 한 배치가
 같은 환자로 치우친다. 8~32 를 권한다.
 
+## Stage C — downstream 미세조정
+
+```bash
+# 토큰 캐시 입력 (빠르다, stem 고정)
+python -m holter_encoder.finetune --splits $OUT/splits.csv --tokens $OUT/tokens_a \
+    --encoder $RUN/stage_b_mamba_attn/encoder.pt --task psvt --out $RUN/ft_psvt_attn --gpus 0
+
+# 원신호 입력 (느리다, stem 까지 학습)
+python -m holter_encoder.finetune --splits $OUT/splits.csv --tokens $OUT/tokens_a \
+    --encoder $RUN/stage_b_mamba_attn/encoder.pt --meta-dir $OUT/segmeta --unfreeze-stem \
+    --task psvt --out $RUN/ft_psvt_attn_e2e --batch 4 --raw-crop 720 --stem-lr 1e-5 --gpus 0
+```
+
+`--unfreeze-stem` 은 캐시 토큰 대신 원신호를 읽어 10초 stem 까지 학습한다.
+PSVT 처럼 사건이 짧고 드문 과제에서 쓴다. 학습은 `--raw-crop` 세그먼트(기본 720 = 2시간)
+무작위 구간만 쓰고, 평가는 24시간 전체를 통과시킨다 — 지금까지 숫자와 같은 기준이다.
+라벨이 record 단위라 양성 record 라도 잘린 구간에 사건이 없을 수 있다(다중 인스턴스 학습).
+`--meta-dir` 가 반드시 필요하고, 평가 배치는 기본 1 이다 (`--eval-batch`).
+
+경로는 `$W` 같은 축약이 아니라 위의 `$OUT`/`$RUN` 을 쓴다. 셸에서 비어 있으면
+`--out` 이 `/runs/...` 가 되어 PermissionError 가 난다.
+
 ## 주의
 
 - time-of-day 는 `.json` 의 `hookup_time` 기준이다. `.hea` 시각은 MARS 내보내기 시각이라 쓰지 않는다.
