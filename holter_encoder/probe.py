@@ -186,7 +186,18 @@ def main():
             return np.where(np.isfinite(A), A, med)
 
         D = fill(np.stack([m["age_num"].values, m["hr"].values, m["male"].values], 1))
-        feats = {"demo": D}          # enc / enc+demo 는 특징 종류마다 아래에서 채운다
+        # 나이를 비선형으로 준 기준선. 로지스틱은 나이를 단조로만 쓰므로, 양성이 특정
+        # 연령대에 뭉쳐 있으면 demo 는 우연 수준인데 인코더는 (심전도에서 나이를 읽어)
+        # 잘 맞히는 일이 생긴다. demo_nl 이 enc 를 따라잡으면 그 태스크는 나이 식별이다.
+        age = m["age_num"].values
+        edges = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 200])
+        bins = np.digitize(np.where(np.isfinite(age), age, -1), edges) - 1
+        onehot = np.zeros((len(age), len(edges)), np.float64)
+        onehot[np.arange(len(age)), np.clip(bins, 0, len(edges) - 1)] = 1.0
+        onehot[~np.isfinite(age)] = 0.0
+        a2 = fill(np.stack([age, age ** 2], 1))
+        D_nl = np.concatenate([D, a2[:, 1:], onehot], 1)
+        feats = {"demo": D, "demo_nl": D_nl}   # enc / enc+demo 는 특징 종류마다 아래에서
         R = None
         if rep_cols:
             R = fill(rep.reindex(rec)[rep_cols].to_numpy(dtype=float))
@@ -220,6 +231,8 @@ def main():
 HOWTO = """
 [읽는 법]
   - enc 가 demo 를 못 넘으면 인코더가 질환 정보를 못 담은 것이다 (특히 TOF)
+  - demo_nl 은 나이를 10세 구간 one-hot + 제곱항으로 준 기준선이다. demo 는 우연인데
+    demo_nl 이 enc 에 근접하면, 그 태스크는 질환이 아니라 연령대 식별이다
   - enc+demo 가 demo 보다 얼마나 올라가는지가 인코더의 순수 기여분이다
   - meta(촬영 조건: 길이·전극 이득·잡음·시각 등)가 enc 와 비슷하면 그 태스크는
     질환이 아니라 배치 효과를 재는 것이다. LongQT/TOF 는 라벨이 코호트 소속이라 특히 위험
