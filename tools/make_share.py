@@ -10,7 +10,8 @@ make_share.py — 원본 + v2 h5 + 라벨 + 코드를 공유용 폴더 하나로
   ├─ raw/<코호트>/...      --raw 의 record(.hea+.SIG 짝)의 .hea/.SIG/.ANN/.json
   ├─ h5/*.h5              --h5 바로 아래의 .h5 + conversion_log.csv (하위 디렉토리는 제외)
   ├─ labels/              splits / manifest / duplicates / 임상 CSV
-  └─ code/holter_psvt/    이 저장소의 HEAD (git archive, log.txt 제외)
+  └─ code/holter_psvt/    변환 코드만 (h5_converter/ + 변환·라벨 tools, git archive HEAD)
+                          학습 코드(holter_encoder, psvt_pipeline)와 실험 문서는 넣지 않는다
 
   - 대용량 복사는 copy_raw.py 를 그대로 쓴다 → .part 원자적 교체, 재실행하면 이어서 진행
   - labels/ 의 splits.csv · manifest.* 는 path 열을 <dest>/h5/<파일명> 으로 바꿔 쓴다
@@ -41,6 +42,23 @@ FROM_H5 = ("splits.csv", "splits_summary.txt", "manifest.csv", "manifest.parquet
 FROM_CLINICAL = ("clinical_data_psvt.csv", "clinical_data_tof.csv", "psvt_labeling.csv")
 # path 열을 새 위치로 바꿔 쓸 표
 REPATH = ("splits.csv", "manifest.csv", "manifest.parquet")
+# code/ 에 넣을 것: 원본 → h5 변환과 라벨 표 생성에 필요한 것만.
+# 이 파일들은 서로만 import 한다 (holter_encoder 를 쓰는 bench_loader/io_bench 는 제외).
+CODE_PATHS = (
+    "h5_converter",
+    "requirements.txt",
+    "tools/run_conversion.py",          # 원본 → v2 h5 대량 변환
+    "tools/copy_raw.py",                # 원본 복사 (재개 가능)
+    "tools/find_duplicates.py",         # 같은 신호 중복 탐지
+    "tools/build_manifest.py",          # h5 전체 → manifest
+    "tools/make_splits.py",             # manifest → split · 라벨
+    "tools/repack_to_v2.py",            # v1 h5 → v2
+    "tools/relabel_leads.py",           # lead 이름만 다시 붙이기
+    "tools/check_lead_order.py",        # 원본 채널이 어떤 lead 인지 판별
+    "tools/check_lead_consistency.py",  # record 간 채널 순서 일치 확인
+    "tools/profile_records.py",         # 코호트 프로파일
+    "tools/inspect_data.py",            # h5 디렉토리 구조 조사
+)
 
 
 def find_duplicates_csv(explicit, roots):
@@ -134,15 +152,11 @@ def copy_code(code_dest, dry):
     if os.path.isdir(dst):
         shutil.rmtree(dst)                         # 이전 스냅샷을 통째로 교체
     os.makedirs(code_dest, exist_ok=True)
-    arc = subprocess.Popen(git + ["archive", "--prefix=holter_psvt/", "HEAD"],
-                           stdout=subprocess.PIPE)
+    arc = subprocess.Popen(git + ["archive", "--prefix=holter_psvt/", "HEAD", "--"]
+                           + list(CODE_PATHS), stdout=subprocess.PIPE)
     subprocess.run(["tar", "-x", "-C", code_dest], stdin=arc.stdout, check=True)
     if arc.wait() != 0:
         sys.exit("git archive 실패")
-    for junk in ("log.txt",):                      # 커밋돼 있지만 공유할 필요 없는 것
-        p = os.path.join(dst, junk)
-        if os.path.exists(p):
-            os.remove(p)
 
 
 def run_copy(cmd):

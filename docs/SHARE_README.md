@@ -31,7 +31,7 @@ holter_total/
 │  ├─ clinical_data_psvt.csv    PSVT 임상 라벨 원본 (Label 1/0)
 │  ├─ clinical_data_tof.csv     TOF 임상 정보 원본
 │  └─ psvt_labeling.csv         PSVT 하위유형(AVNRT/AVRT) 라벨 — 아직 학습에 안 씀
-└─ code/holter_psvt/            변환·전처리·학습 코드 (git 저장소 스냅샷)
+└─ code/holter_psvt/            원본 → h5 변환 · 라벨 생성 코드
 ```
 
 처음 쓴다면 **`labels/splits.csv` + `h5/`** 두 가지만 있으면 됩니다. `raw/` 는 재변환하거나
@@ -132,14 +132,21 @@ train, test = psvt[psvt.split == "train"], psvt[psvt.split == "test"]
 
 ## 5. 코드 (`code/holter_psvt/`)
 
-| 폴더 | 내용 |
-|---|---|
-| `h5_converter/` | 원본 → h5 변환 (`fix_pid.py`, `convert_to_h5.py`, `schema_v2.py`) |
-| `tools/` | 대량 변환·중복 탐지·manifest·split 생성 등 |
-| `holter_encoder/` | 24h SSL 인코더 (Stage A/B) 와 probe 평가 |
-| `psvt_pipeline/` | 초기 MIL 기반 PSVT 분류 (v1 h5 기준) |
+원본 → h5 변환과 라벨 표 생성에 필요한 코드만 넣었습니다. 학습·평가 코드는 포함하지 않습니다.
 
-설치: `pip install -r code/holter_psvt/requirements.txt` (torch 는 CUDA 버전에 맞춰 따로)
+| 경로 | 내용 |
+|---|---|
+| `h5_converter/` | 변환 본체 (`convert_to_h5.py`, `schema_v2.py`, `utils.py`, `fix_pid.py`) · 스키마 문서 `SCHEMA_V2.md` |
+| `tools/run_conversion.py` | 원본 → v2 h5 대량 변환 (Ray 병렬, 재개 가능) |
+| `tools/find_duplicates.py` | 이름만 다르고 신호가 같은 record 탐지 → `duplicates.csv` |
+| `tools/build_manifest.py` | h5 전체를 훑어 `manifest.csv` 생성, 임상 CSV 조인 |
+| `tools/make_splits.py` | manifest → 환자 단위 split · 라벨 → `splits.csv` |
+| `tools/repack_to_v2.py` | 예전(v1) h5 를 v2 로 다시 담기 |
+| `tools/check_lead_order.py`, `check_lead_consistency.py`, `relabel_leads.py` | 채널(lead) 순서 판별·확인·이름 붙이기 |
+| `tools/copy_raw.py`, `profile_records.py`, `inspect_data.py` | 원본 복사, 코호트 프로파일, h5 구조 조사 |
+
+설치: `pip install -r code/holter_psvt/requirements.txt`
+(`scikit-learn` 은 변환에 필요 없습니다. torch 도 필요 없습니다.)
 
 ### h5 · 라벨을 다시 만드는 순서
 
@@ -162,7 +169,6 @@ python tools/make_splits.py --manifest $OUT/manifest.csv --out $OUT/splits     #
 
 `run_conversion.py` 는 출력에 이미 있는 record 를 건너뛰므로 중단 후 다시 실행하면 이어집니다.
 NAS(`Holter_TOF/`) 읽기는 약 86 MB/s 라, 많이 읽을 거면 `raw/` 를 로컬 디스크로 먼저 복사하세요.
-모델 학습·평가 절차는 `docs/METHOD.md`, 실험 결과와 교란 분석은 `docs/EXPERIMENTS.md` 에 있습니다.
 
 ---
 
@@ -172,7 +178,8 @@ NAS(`Holter_TOF/`) 읽기는 약 86 MB/s 라, 많이 읽을 거면 `raw/` 를 �
 |---|---|
 | v1 h5 (`Holter_TOF/holter_h5`, `nas1_Holter_PSVT/h5`) | v2 로 대체됨. 세그먼트당 dataset 구조라 24h 읽기가 느림 |
 | `denoised_3_lead`, `10s_segment_final`, `remove_silent_bandpass_notch` | 예전 실험용 전처리 산출물 |
-| `segmeta/`, `tokens_a/`, `runs/` (체크포인트·임베딩) | 코드로 다시 만들 수 있는 학습 중간 산출물 |
+| 학습·평가 코드 (`holter_encoder/`, `psvt_pipeline/`, 실험 문서) | 이 패키지는 데이터와 변환까지만 다룹니다 |
+| `segmeta/`, `tokens_a/`, `runs/` (체크포인트·임베딩) | 학습 중간 산출물 |
 
 ---
 
