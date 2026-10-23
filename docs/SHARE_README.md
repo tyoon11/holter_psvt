@@ -144,6 +144,7 @@ train, test = psvt[psvt.split == "train"], psvt[psvt.split == "test"]
 | `tools/repack_to_v2.py` | 예전(v1) h5 를 v2 로 다시 담기 |
 | `tools/check_lead_order.py`, `check_lead_consistency.py`, `relabel_leads.py` | 채널(lead) 순서 판별·확인·이름 붙이기 |
 | `tools/copy_raw.py`, `profile_records.py`, `inspect_data.py` | 원본 복사, 코호트 프로파일, h5 구조 조사 |
+| `tools/list_pids.py` | 코호트별 PID 목록 txt, 파일명·`.json`·임상 CSV 간 PID 매칭 점검 |
 
 설치: `pip install -r code/holter_psvt/requirements.txt`
 (`scikit-learn` 은 변환에 필요 없습니다. torch 도 필요 없습니다.)

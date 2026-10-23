@@ -58,6 +58,7 @@ CODE_PATHS = (
     "tools/check_lead_consistency.py",  # record 간 채널 순서 일치 확인
     "tools/profile_records.py",         # 코호트 프로파일
     "tools/inspect_data.py",            # h5 디렉토리 구조 조사
+    "tools/list_pids.py",               # 코호트별 PID 목록 · 임상 CSV 매칭 점검
 )
 
 
